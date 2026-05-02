@@ -44,19 +44,24 @@ def collect_all_charts(ratios: Dict, dupont: Dict, trend_df: pd.DataFrame,
                         compare_df: pd.DataFrame, year: int) -> List[Dict]:
     """
     生成所有图表对象,返回:
-    [{"id": "trend_profit", "title": "盈利能力趋势", "fig": <plotly Figure>}, ...]
+    [{"id": "trend_profit", "title": "...", "category": "...",
+      "section_anchor": "盈利能力", "fig": <plotly>}, ...]
+
+    section_anchor 用于把图表嵌入到 LLM 报告对应章节
+    匹配规则:LLM 报告的二级标题包含 anchor 字符串就把图插到那个章节
     """
     charts = []
 
-    # 1. 杜邦瀑布图
+    # 1. 杜邦瀑布图 → 嵌入"杜邦"章节
     charts.append({
         "id": "dupont_waterfall",
         "title": f"{year} 年杜邦三因素分解",
         "category": "杜邦分析",
+        "section_anchor": "杜邦",
         "fig": plot_dupont_waterfall(dupont, year),
     })
 
-    # 2. 杜邦多年趋势
+    # 2. 杜邦多年趋势 → 嵌入"杜邦"章节
     if not trend_df.empty:
         dupont_history = {}
         for col in trend_df.columns:
@@ -71,35 +76,41 @@ def collect_all_charts(ratios: Dict, dupont: Dict, trend_df: pd.DataFrame,
             "id": "dupont_trend",
             "title": "杜邦三因素历年趋势",
             "category": "杜邦分析",
+            "section_anchor": "杜邦",
             "fig": plot_dupont_decomposition(dupont_history),
         })
 
-    # 3-5. 三类趋势图
+    # 3. 盈利能力趋势 → 嵌入"盈利"章节
     if not trend_df.empty:
         charts.append({
             "id": "trend_profit",
-            "title": "盈利能力趋势",
+            "title": "盈利能力趋势(毛利率 / 营业利润率 / 净利率)",
             "category": "趋势分析",
+            "section_anchor": "盈利",
             "fig": plot_trend(trend_df,
                 ["毛利率 (Gross Margin)", "营业利润率 (Operating Margin)",
                  "净利率 (Net Margin)"], title="盈利能力趋势"),
         })
+        # 4. 股东回报趋势 → 嵌入"趋势"或"杜邦"章节
         charts.append({
             "id": "trend_return",
-            "title": "股东回报趋势",
+            "title": "股东回报趋势(ROE / ROA)",
             "category": "趋势分析",
+            "section_anchor": "趋势",
             "fig": plot_trend(trend_df,
                 ["ROE 净资产收益率", "ROA 总资产收益率"], title="股东回报趋势"),
         })
+        # 5. 偿债能力趋势 → 嵌入"偿债"章节
         charts.append({
             "id": "trend_solvency",
-            "title": "偿债能力趋势",
+            "title": "偿债能力趋势(流动 / 速动 / 资产负债率)",
             "category": "趋势分析",
+            "section_anchor": "偿债",
             "fig": plot_trend(trend_df,
                 ["流动比率", "速动比率", "资产负债率"], title="偿债能力趋势"),
         })
 
-    # 6-9. 同行对比柱状图 + 雷达
+    # 6-9. 同行对比柱状图 + 雷达 → 全部嵌入"同行"章节
     if not compare_df.empty and len(compare_df.columns) >= 2:
         for m in ["净利率 (Net Margin)", "ROE 净资产收益率",
                   "ROA 总资产收益率", "资产负债率"]:
@@ -108,6 +119,7 @@ def collect_all_charts(ratios: Dict, dupont: Dict, trend_df: pd.DataFrame,
                     "id": f"peer_{m}",
                     "title": f"同行对比: {m}",
                     "category": "同行对比",
+                    "section_anchor": "同行",
                     "fig": plot_peer_comparison(compare_df, m),
                 })
 
@@ -116,8 +128,9 @@ def collect_all_charts(ratios: Dict, dupont: Dict, trend_df: pd.DataFrame,
                          "毛利率 (Gross Margin)", "流动比率"]
         charts.append({
             "id": "radar",
-            "title": "综合能力雷达图",
+            "title": "综合能力雷达图(目标公司 vs 同行均值)",
             "category": "同行对比",
+            "section_anchor": "同行",
             "fig": plot_radar(compare_df, radar_metrics),
         })
 
@@ -125,93 +138,100 @@ def collect_all_charts(ratios: Dict, dupont: Dict, trend_df: pd.DataFrame,
 
 
 # ============================================================
-# 调用 LLM 生成深度分析
+# 调用 LLM 生成分章节深度分析
 # ============================================================
-def generate_llm_analysis(company_info: Dict, ratios: Dict, dupont: Dict,
-                            trend_df: pd.DataFrame, compare_df: pd.DataFrame,
-                            year: int, api_key: str,
-                            model: str = "gpt-4o-mini") -> str:
-    """调用 LLM 基于所有数据生成专业的中文深度分析"""
+def generate_section_analyses(company_info: Dict, ratios: Dict, dupont: Dict,
+                                trend_df: pd.DataFrame, compare_df: pd.DataFrame,
+                                year: int, api_key: str,
+                                model: str = "gpt-4o-mini") -> Dict[str, str]:
+    """
+    调用 LLM 为每个章节单独生成基于数据的分析。
+    返回:
+    {
+      "overview": "...",
+      "profitability": "...",
+      "operating": "...",
+      "solvency": "...",
+      "dupont": "...",
+      "trend": "...",
+      "peer": "...",
+      "diagnosis": "..."
+    }
+    """
     from openai import OpenAI
+    import json as _json
 
-    # 准备喂给 LLM 的结构化数据
+    # 准备数据
     def clean_ratios(d):
         return {k: round(v, 4) if v is not None else None
                 for k, v in d.items() if not k.startswith("_")}
 
-    data_summary = {
-        "公司": {
+    data = {
+        "公司信息": {
             "名称": company_info.get("name"),
             "代码": company_info.get("ticker"),
             "行业": company_info.get("sector"),
             "子行业": company_info.get("industry"),
             "国家": company_info.get("country"),
-            "市值": company_info.get("market_cap"),
-            "币种": company_info.get("currency"),
+            "市值(原币)": company_info.get("market_cap"),
+            "财报币种": company_info.get("currency"),
+            "业务简介": (company_info.get("summary") or "")[:300],
         },
         "财年": year,
-        "比率": clean_ratios(ratios),
+        "全部比率": clean_ratios(ratios),
         "杜邦分解": {k: round(v, 4) if v else None for k, v in dupont.items()},
     }
 
-    # 趋势数据
     if not trend_df.empty:
         trend_dict = {}
         for idx in trend_df.index:
             trend_dict[idx] = {str(c): round(v, 4) if pd.notna(v) else None
                                 for c, v in trend_df.loc[idx].items()}
-        data_summary["历年趋势"] = trend_dict
+        data["历年趋势"] = trend_dict
 
-    # 同行数据
     if not compare_df.empty:
         peer_dict = {}
         for idx in compare_df.index:
             peer_dict[idx] = {str(c): round(v, 4) if pd.notna(v) else None
                                 for c, v in compare_df.loc[idx].items()}
-        data_summary["同行对比"] = peer_dict
+        data["同行对比"] = peer_dict
 
-    system_prompt = """你是一名资深的财务分析师,擅长基于上市公司财务数据撰写专业、深入、有洞察力的中文分析报告。
+    system_prompt = """你是一名资深财务分析师。我会给你一家上市公司的完整财务数据,你需要为一份分章节的财务分析报告撰写**8 个章节**的文字分析。
 
-# 写作要求
-- **严谨专业**:用财会术语,但不晦涩
-- **深度洞察**:不只罗列数字,要解释"为什么"、"意味着什么"、"对投资者意味着什么"
-- **结构清晰**:用 ## 二级标题分章节,## 下用 ### 三级标题
-- **数据驱动**:每个判断都要用具体数字支持
-- **批判性思维**:既看到亮点,也指出风险和异常
-- **行业语境**:结合该行业特性解读(如银行业杠杆高很正常)
-- **历史对比**:利用历年趋势数据指出方向性变化
-- **同行参照**:利用同行对比数据指出相对优劣
+# 关键要求(必读)
+1. 用户阅读报告时是这样的体验:**先看图表/数据表,再看你的文字分析**。所以你的文字应该频繁引用具体数字,**像在解读上方的图表/表格**。
+2. 不要在文字里说"如下表"、"如下图所示"——因为图表是在你的文字**之前**出现的,要用"上表显示"、"上图可见"、"从图中可以看出"。
+3. 绝对不要在文字里贴 Markdown 表格(系统已经渲染了实际表格)。
+4. 每段都基于具体数字给出**专业洞察**,而不是简单复述数字。
+5. 注意行业语境(银行业杠杆高正常、科技公司毛利率高合理、零售业周转率才是核心等)。
+6. 历年趋势数据存在时,务必结合趋势讲"方向"。
+7. 同行数据存在时,务必给出"相对位置"判断。
 
-# 报告结构(必须包含这些章节)
-## 一、公司概览与行业地位
-## 二、盈利能力深度分析
-## 三、运营效率分析
-## 四、偿债能力与财务结构
-## 五、杜邦分析:ROE 驱动力拆解
-## 六、历年趋势与发展轨迹
-## 七、同行业对标分析
-## 八、综合诊断与投资视角
-   ### 优势
-   ### 风险与不足
-   ### 投资者关注要点
+# 8 个章节的分工
+- **overview**:公司概览。基于公司信息表和市值,简评公司的市场地位、行业属性、规模量级。约 150-250 字。
+- **profitability**:盈利能力分析。基于盈利能力图(毛利率/营业利润率/净利率趋势)和比率表中的盈利相关指标,深入分析盈利质量、利润结构和趋势变化。约 250-350 字。
+- **operating**:运营效率。基于资产周转率、存货周转率、应收账款周转率,分析运营效率水平,结合行业特性。约 200-300 字。
+- **solvency**:偿债能力与财务结构。基于偿债趋势图(流动比率/速动比率/资产负债率)和指标表,分析短期流动性和长期偿债能力。约 200-300 字。
+- **dupont**:杜邦分析。基于杜邦瀑布图(单年三因素)和杜邦历年趋势图(三因素如何变化),拆解 ROE 的核心驱动力,识别哪个因素在变化。约 250-350 字。
+- **trend**:历年综合趋势。基于股东回报趋势图(ROE/ROA),结合所有趋势数据,讲发展轨迹和方向性变化。约 200-300 字。
+- **peer**:同行业对标。基于同行对比柱状图(净利率/ROE/ROA/资产负债率)和雷达图,分析公司在同行中的相对位置,优劣势。如果没有同行数据,写"未提供同行数据"即可。约 250-350 字。
+- **diagnosis**:综合诊断与投资视角。结合所有上述分析,以"### 优势"、"### 风险与不足"、"### 投资者关注要点"三个三级标题给出综合判断。约 300-400 字。
 
-# 重要约束
-- **绝对**不要在报告中说"图表显示"、"如图所示"等表述,因为这是文字版本,后续会插入图表
-- 绝对不要使用 Markdown 表格(报告会另外插入数据表)
-- 不要重复堆砌相同的数据多次
-- 篇幅:1500-2500 字之间(不算空行)
-- 用具体数字而非模糊词,例如"ROE 22.5%"不要写"ROE 较高"
-- 如某项数据缺失(N/A),不要捏造,跳过即可"""
-
-    user_prompt = f"""请基于以下数据,撰写一份关于 **{data_summary['公司']['名称']}** \
-({data_summary['公司']['代码']}) {year} 年度的专业财务分析报告。
-
-# 完整数据
-```json
-{json.dumps(data_summary, ensure_ascii=False, indent=2)}
+# 输出格式(必须严格遵守)
+直接返回 JSON 对象,**不要**用 ```json 代码块包裹,不要任何前后说明文字。结构:
+```
+{"overview": "文字", "profitability": "文字", "operating": "文字", "solvency": "文字", "dupont": "文字", "trend": "文字", "peer": "文字", "diagnosis": "文字"}
 ```
 
-请直接输出 Markdown 格式的报告内容(不要有 ```markdown 代码块包裹),从 ## 一、公司概览与行业地位 开始。"""
+每个值是 Markdown 文本(可以用 **粗体**、- 列表、### 三级标题),但不要用 # 一级或 ## 二级标题(系统已经处理章节标题了)。"""
+
+    user_prompt = f"""基于以下数据,为 **{data['公司信息']['名称']}** ({data['公司信息']['代码']}) {year} 年度生成分章节的财务分析。
+
+```json
+{_json.dumps(data, ensure_ascii=False, indent=2)}
+```
+
+请直接输出 JSON 对象,以 {{ 开始 }} 结束。"""
 
     client = OpenAI(api_key=api_key)
     resp = client.chat.completions.create(
@@ -222,8 +242,51 @@ def generate_llm_analysis(company_info: Dict, ratios: Dict, dupont: Dict,
         ],
         temperature=0.4,
         max_tokens=4000,
+        response_format={"type": "json_object"},  # 强制 JSON
     )
-    return resp.choices[0].message.content or ""
+    content = resp.choices[0].message.content or "{}"
+
+    try:
+        sections = _json.loads(content)
+    except _json.JSONDecodeError:
+        # 兜底:返回空 dict,让前端有 fallback
+        sections = {}
+
+    # 确保 8 个 key 都有
+    expected_keys = ["overview", "profitability", "operating", "solvency",
+                     "dupont", "trend", "peer", "diagnosis"]
+    for k in expected_keys:
+        if k not in sections:
+            sections[k] = ""
+
+    return sections
+
+
+# 兼容旧 API 的封装(把分章节合成一段长文,供下载用)
+def generate_llm_analysis(company_info: Dict, ratios: Dict, dupont: Dict,
+                            trend_df: pd.DataFrame, compare_df: pd.DataFrame,
+                            year: int, api_key: str,
+                            model: str = "gpt-4o-mini") -> str:
+    """旧 API 兼容封装:返回合并的 Markdown 文本"""
+    sections = generate_section_analyses(
+        company_info, ratios, dupont, trend_df, compare_df, year, api_key, model
+    )
+    titles = {
+        "overview": "## 一、公司概览",
+        "profitability": "## 二、盈利能力分析",
+        "operating": "## 三、运营效率",
+        "solvency": "## 四、偿债能力与财务结构",
+        "dupont": "## 五、杜邦分析:ROE 驱动力拆解",
+        "trend": "## 六、历年趋势与发展轨迹",
+        "peer": "## 七、同行业对标分析",
+        "diagnosis": "## 八、综合诊断与投资视角",
+    }
+    parts = []
+    for key, title in titles.items():
+        body = sections.get(key, "").strip()
+        if body:
+            parts.append(f"{title}\n\n{body}")
+    return "\n\n".join(parts)
 
 
 # ============================================================
@@ -314,48 +377,13 @@ def _inline_md(text: str) -> str:
     return text
 
 
-def build_html_report(company_info: Dict, year: int, llm_analysis: str,
-                       charts: List[Dict], ratios: Dict,
-                       compare_df: pd.DataFrame) -> str:
-    """构建完整 HTML 报告"""
-    name = company_info.get("name", "Company")
-    ticker = company_info.get("ticker", "")
-    sector = company_info.get("sector", "—")
-    industry = company_info.get("industry", "—")
-    currency = company_info.get("currency", "USD")
-    mcap = company_info.get("market_cap")
-    mcap_str = f"{mcap/1e9:.1f}B {currency}" if mcap else "—"
-
-    # 渲染所有图表为 base64
-    chart_html_blocks = {}
-    for chart in charts:
-        b64 = fig_to_png_base64(chart["fig"])
-        if b64:
-            chart_html_blocks[chart["id"]] = f"""
-            <div class="chart-block">
-                <img src="data:image/png;base64,{b64}" alt="{chart['title']}" />
-                <div class="chart-caption">图: {chart['title']}</div>
-            </div>"""
-        else:
-            chart_html_blocks[chart["id"]] = (
-                f'<p class="chart-caption">⚠️ 图表「{chart["title"]}」无法渲染'
-                f'(服务器缺少 kaleido 库)</p>'
-            )
-
-    # LLM 分析转 HTML
-    analysis_html = md_to_html(llm_analysis)
-
-    # 把图表插入到合适章节
-    # 策略:在 LLM 分析后,按章节追加图表
-    charts_by_category = {}
-    for ch in charts:
-        cat = ch["category"]
-        charts_by_category.setdefault(cat, []).append(ch)
-
-    # 生成数据表 HTML(关键比率表)
-    ratios_table_html = "<table><thead><tr><th>指标</th><th>数值</th></tr></thead><tbody>"
-    for k, v in ratios.items():
-        if k.startswith("_"):
+def _build_ratios_subset_table(ratios: Dict, keys: List[str]) -> str:
+    """生成指定指标子集的 HTML 表格"""
+    rows_html = ""
+    has_data = False
+    for k in keys:
+        v = ratios.get(k)
+        if v is None and k not in ratios:
             continue
         is_pct = (any(kw in k for kw in ["ROE", "ROA", "ROIC", "Margin"]) or
                   ("率" in k and not any(x in k for x in ["流动比率", "速动比率", "周转率"])))
@@ -367,38 +395,156 @@ def build_html_report(company_info: Dict, year: int, llm_analysis: str,
             disp = f"{v/1e6:.1f}M"
         else:
             disp = f"{v:.3f}"
-        ratios_table_html += f"<tr><td>{k}</td><td>{disp}</td></tr>"
-    ratios_table_html += "</tbody></table>"
+        rows_html += f"<tr><td>{k}</td><td><strong>{disp}</strong></td></tr>"
+        has_data = True
+    if not has_data:
+        return ""
+    return f"""<table><thead><tr><th>指标</th><th>数值</th></tr></thead>
+<tbody>{rows_html}</tbody></table>"""
 
-    # 同行对比表
-    peer_table_html = ""
-    if not compare_df.empty:
-        peer_table_html = "<h3>同行业数据对照表</h3><table><thead><tr><th>指标</th>"
+
+def _build_company_info_table(info: Dict) -> str:
+    """公司基本信息表"""
+    mcap = info.get("market_cap")
+    mcap_str = f"{mcap/1e9:.1f}B {info.get('currency', 'USD')}" if mcap else "—"
+    rows = [
+        ("公司名称", info.get("name", "—")),
+        ("股票代码", info.get("ticker", "—")),
+        ("行业", info.get("sector", "—")),
+        ("子行业", info.get("industry", "—")),
+        ("国家/地区", info.get("country", "—")),
+        ("市值", mcap_str),
+        ("财报币种", info.get("currency", "—")),
+    ]
+    rows_html = "".join(f"<tr><td>{k}</td><td>{v}</td></tr>" for k, v in rows)
+    return f"<table><tbody>{rows_html}</tbody></table>"
+
+
+def _build_peer_table(compare_df: pd.DataFrame) -> str:
+    """同行对比表 HTML"""
+    if compare_df.empty:
+        return ""
+    html = "<table><thead><tr><th>指标</th>"
+    for col in compare_df.columns:
+        html += f"<th>{col}</th>"
+    html += "</tr></thead><tbody>"
+    for idx in compare_df.index:
+        is_pct = (any(kw in idx for kw in ["ROE", "ROA", "Margin"]) or
+                  ("率" in idx and not any(x in idx for x in ["流动比率", "速动比率", "周转率"])))
+        html += f"<tr><td>{idx}</td>"
         for col in compare_df.columns:
-            peer_table_html += f"<th>{col}</th>"
-        peer_table_html += "</tr></thead><tbody>"
-        for idx in compare_df.index:
-            is_pct = (any(kw in idx for kw in ["ROE", "ROA", "Margin"]) or
-                      ("率" in idx and not any(x in idx for x in ["流动比率", "速动比率", "周转率"])))
-            peer_table_html += f"<tr><td>{idx}</td>"
-            for col in compare_df.columns:
-                v = compare_df.loc[idx, col]
-                if pd.isna(v):
-                    disp = "—"
-                elif is_pct:
-                    disp = f"{v*100:.2f}%"
-                else:
-                    disp = f"{v:.3f}"
-                peer_table_html += f"<td>{disp}</td>"
-            peer_table_html += "</tr>"
-        peer_table_html += "</tbody></table>"
+            v = compare_df.loc[idx, col]
+            if pd.isna(v):
+                disp = "—"
+            elif is_pct:
+                disp = f"{v*100:.2f}%"
+            else:
+                disp = f"{v:.3f}"
+            html += f"<td>{disp}</td>"
+        html += "</tr>"
+    html += "</tbody></table>"
+    return html
 
-    # 拼接图表节
-    charts_section = ""
-    for cat, chs in charts_by_category.items():
-        charts_section += f"<h2>📊 {cat}</h2>\n"
-        for ch in chs:
-            charts_section += chart_html_blocks.get(ch["id"], "")
+
+def build_html_report(company_info: Dict, year: int, sections: Dict[str, str],
+                       charts: List[Dict], ratios: Dict,
+                       compare_df: pd.DataFrame) -> str:
+    """
+    构建 HTML 报告 - 按"图/表 → 文字"模式渲染各章节
+    sections: 来自 generate_section_analyses 的 8 个章节文字
+    """
+    name = company_info.get("name", "Company")
+    ticker = company_info.get("ticker", "")
+    sector = company_info.get("sector", "—")
+    industry = company_info.get("industry", "—")
+    currency = company_info.get("currency", "USD")
+    mcap = company_info.get("market_cap")
+    mcap_str = f"{mcap/1e9:.1f}B {currency}" if mcap else "—"
+
+    # 渲染所有图表为 base64,按 id 索引
+    chart_blocks = {}
+    for chart in charts:
+        b64 = fig_to_png_base64(chart["fig"])
+        if b64:
+            chart_blocks[chart["id"]] = f"""
+<div class="chart-block">
+    <img src="data:image/png;base64,{b64}" alt="{chart['title']}" />
+    <div class="chart-caption">图: {chart['title']}</div>
+</div>"""
+        else:
+            chart_blocks[chart["id"]] = (
+                f'<p class="chart-caption">⚠️ 图表「{chart["title"]}」无法渲染</p>'
+            )
+
+    def render_md(text: str) -> str:
+        """章节文字 (md) → HTML"""
+        if not text or not text.strip():
+            return "<p><em>(本章节暂无分析)</em></p>"
+        return f'<div class="section-text">{md_to_html(text)}</div>'
+
+    # 各章节使用的指标分组
+    profit_keys = ["毛利率 (Gross Margin)", "营业利润率 (Operating Margin)",
+                   "净利率 (Net Margin)", "ROA 总资产收益率", "ROE 净资产收益率"]
+    operating_keys = ["总资产周转率", "存货周转率", "应收账款周转率"]
+    solvency_keys = ["流动比率", "速动比率", "资产负债率", "权益乘数 (Equity Multiplier)",
+                     "利息保障倍数"]
+
+    # 找指定 anchor 的图表 id 列表
+    def chart_ids_for(anchor: str) -> List[str]:
+        return [c["id"] for c in charts if c.get("section_anchor") == anchor]
+
+    def insert_charts(ids: List[str]) -> str:
+        return "".join(chart_blocks.get(i, "") for i in ids)
+
+    # ========== 拼装各章节 ==========
+    body_html = ""
+
+    # 一、公司概览
+    body_html += "<h2>一、公司概览与行业地位</h2>\n"
+    body_html += _build_company_info_table(company_info)
+    body_html += render_md(sections.get("overview", ""))
+
+    # 二、盈利能力
+    body_html += "<h2>二、盈利能力分析</h2>\n"
+    body_html += insert_charts(chart_ids_for("盈利"))
+    body_html += "<h3>核心盈利指标</h3>"
+    body_html += _build_ratios_subset_table(ratios, profit_keys)
+    body_html += render_md(sections.get("profitability", ""))
+
+    # 三、运营效率
+    body_html += "<h2>三、运营效率</h2>\n"
+    body_html += "<h3>运营效率指标</h3>"
+    body_html += _build_ratios_subset_table(ratios, operating_keys)
+    body_html += render_md(sections.get("operating", ""))
+
+    # 四、偿债能力
+    body_html += "<h2>四、偿债能力与财务结构</h2>\n"
+    body_html += insert_charts(chart_ids_for("偿债"))
+    body_html += "<h3>偿债能力指标</h3>"
+    body_html += _build_ratios_subset_table(ratios, solvency_keys)
+    body_html += render_md(sections.get("solvency", ""))
+
+    # 五、杜邦分析
+    body_html += "<h2>五、杜邦分析:ROE 驱动力拆解</h2>\n"
+    body_html += insert_charts(chart_ids_for("杜邦"))
+    body_html += render_md(sections.get("dupont", ""))
+
+    # 六、历年趋势
+    body_html += "<h2>六、历年趋势与发展轨迹</h2>\n"
+    body_html += insert_charts(chart_ids_for("趋势"))
+    body_html += render_md(sections.get("trend", ""))
+
+    # 七、同行业对标
+    body_html += "<h2>七、同行业对标分析</h2>\n"
+    if not compare_df.empty:
+        body_html += "<h3>同行对照表</h3>"
+        body_html += _build_peer_table(compare_df)
+        body_html += insert_charts(chart_ids_for("同行"))
+    body_html += render_md(sections.get("peer", ""))
+
+    # 八、综合诊断
+    body_html += "<h2>八、综合诊断与投资视角</h2>\n"
+    body_html += render_md(sections.get("diagnosis", ""))
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -417,19 +563,11 @@ def build_html_report(company_info: Dict, year: int, llm_analysis: str,
 </p>
 
 <div class="summary-box">
-本报告由 AI 财务分析 Agent 自动生成,综合杜邦分析、趋势分析、同行业比较和基准评级,\
-并由大语言模型撰写深度解读。
+本报告由 AI 财务分析 Agent 自动生成。每个章节先呈现关键数据(图表/表格),\
+再由 AI 基于这些数据展开专业分析。
 </div>
 
-<h2>📋 关键比率一览</h2>
-{ratios_table_html}
-
-{peer_table_html}
-
-<h2>🤖 AI 深度分析</h2>
-{analysis_html}
-
-{charts_section}
+{body_html}
 
 <div class="footer">
 本报告基于 Yahoo Finance 公开财务数据自动生成,仅供学术与参考用途,不构成投资建议。<br>
@@ -443,18 +581,18 @@ Generated by Financial Analysis AI Agent.
 # ============================================================
 # DOCX 报告
 # ============================================================
-def build_docx_report(company_info: Dict, year: int, llm_analysis: str,
+def build_docx_report(company_info: Dict, year: int, sections: Dict[str, str],
                        charts: List[Dict], ratios: Dict,
                        compare_df: pd.DataFrame) -> bytes:
-    """构建 Word 报告 → bytes"""
+    """构建 Word 报告 → bytes(按章节+图表先于文字模式)"""
     from docx import Document
-    from docx.shared import Inches, Pt, RGBColor
+    from docx.shared import Inches, Pt
     from docx.enum.text import WD_ALIGN_PARAGRAPH
 
     doc = Document()
 
     # 标题
-    title = doc.add_heading(
+    doc.add_heading(
         f"{company_info.get('name', '')} ({company_info.get('ticker', '')})", level=0)
     subtitle = doc.add_paragraph(f"{year} 年度财务分析报告")
     subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -469,46 +607,108 @@ def build_docx_report(company_info: Dict, year: int, llm_analysis: str,
     meta_p.add_run(f"市值: {mcap_str}").italic = True
 
     doc.add_paragraph(
-        "本报告由 AI 财务分析 Agent 自动生成,综合多种分析方法并由 LLM 撰写深度解读。"
+        "本报告由 AI 财务分析 Agent 自动生成。每章节先呈现关键数据(图表/表格),"
+        "再由 AI 基于这些数据展开专业分析。"
     )
 
-    # 关键比率表
-    doc.add_heading("📋 关键比率一览", level=1)
-    table = doc.add_table(rows=1, cols=2)
-    table.style = "Light Grid Accent 1"
-    hdr = table.rows[0].cells
-    hdr[0].text = "指标"
-    hdr[1].text = "数值"
-    for k, v in ratios.items():
-        if k.startswith("_"):
-            continue
-        is_pct = (any(kw in k for kw in ["ROE", "ROA", "ROIC", "Margin"]) or
-                  ("率" in k and not any(x in k for x in ["流动比率", "速动比率", "周转率"])))
-        if v is None:
-            disp = "—"
-        elif is_pct:
-            disp = f"{v*100:.2f}%"
-        elif abs(v) > 1e6:
-            disp = f"{v/1e6:.1f}M"
-        else:
-            disp = f"{v:.3f}"
-        row = table.add_row().cells
-        row[0].text = k
-        row[1].text = disp
+    # ========== 辅助函数 ==========
+    def add_md_paragraphs(text: str):
+        """把 Markdown 文字段落写入 docx,处理 **粗体**、列表、### 标题"""
+        if not text or not text.strip():
+            doc.add_paragraph("(本章节暂无分析)").italic = True
+            return
+        for line in text.split("\n"):
+            line = line.rstrip()
+            if not line.strip():
+                continue
+            if line.startswith("### "):
+                doc.add_heading(line[4:], level=3)
+            elif line.startswith("- ") or line.startswith("* "):
+                p = doc.add_paragraph(style="List Bullet")
+                _add_runs_with_bold(p, line[2:])
+            else:
+                p = doc.add_paragraph()
+                _add_runs_with_bold(p, line)
 
-    # 同行表
-    if not compare_df.empty:
-        doc.add_heading("同行业对照", level=2)
-        peer_table = doc.add_table(rows=1, cols=len(compare_df.columns) + 1)
-        peer_table.style = "Light Grid Accent 1"
-        hdr = peer_table.rows[0].cells
+    def add_ratios_table(keys: List[str]):
+        """添加指定指标子集的表格"""
+        valid_rows = []
+        for k in keys:
+            v = ratios.get(k)
+            if v is None and k not in ratios:
+                continue
+            is_pct = (any(kw in k for kw in ["ROE", "ROA", "ROIC", "Margin"]) or
+                      ("率" in k and not any(x in k for x in ["流动比率", "速动比率", "周转率"])))
+            if v is None:
+                disp = "—"
+            elif is_pct:
+                disp = f"{v*100:.2f}%"
+            elif abs(v) > 1e6:
+                disp = f"{v/1e6:.1f}M"
+            else:
+                disp = f"{v:.3f}"
+            valid_rows.append((k, disp))
+        if not valid_rows:
+            return
+        table = doc.add_table(rows=1, cols=2)
+        table.style = "Light Grid Accent 1"
+        hdr = table.rows[0].cells
+        hdr[0].text = "指标"
+        hdr[1].text = "数值"
+        for k, disp in valid_rows:
+            row = table.add_row().cells
+            row[0].text = k
+            row[1].text = disp
+
+    def add_charts_for(anchor: str):
+        """插入指定 anchor 的所有图表"""
+        for ch in charts:
+            if ch.get("section_anchor") != anchor:
+                continue
+            png = fig_to_png_bytes(ch["fig"])
+            if png:
+                doc.add_picture(io.BytesIO(png), width=Inches(6.0))
+                cap = doc.add_paragraph(f"图: {ch['title']}")
+                cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                for run in cap.runs:
+                    run.italic = True
+                    run.font.size = Pt(9)
+            else:
+                p = doc.add_paragraph(f"⚠️ 图表「{ch['title']}」无法渲染")
+                for run in p.runs:
+                    run.italic = True
+
+    def add_company_info_table():
+        """公司基本信息表"""
+        rows_data = [
+            ("公司名称", company_info.get("name", "—")),
+            ("股票代码", company_info.get("ticker", "—")),
+            ("行业", company_info.get("sector", "—")),
+            ("子行业", company_info.get("industry", "—")),
+            ("国家/地区", company_info.get("country", "—")),
+            ("市值", mcap_str),
+            ("财报币种", company_info.get("currency", "—")),
+        ]
+        table = doc.add_table(rows=len(rows_data), cols=2)
+        table.style = "Light Grid Accent 1"
+        for i, (k, v) in enumerate(rows_data):
+            table.rows[i].cells[0].text = k
+            table.rows[i].cells[1].text = str(v)
+
+    def add_peer_table():
+        """同行对照表"""
+        if compare_df.empty:
+            return
+        table = doc.add_table(rows=1, cols=len(compare_df.columns) + 1)
+        table.style = "Light Grid Accent 1"
+        hdr = table.rows[0].cells
         hdr[0].text = "指标"
         for i, col in enumerate(compare_df.columns):
             hdr[i + 1].text = str(col)[:25]
         for idx in compare_df.index:
             is_pct = (any(kw in idx for kw in ["ROE", "ROA", "Margin"]) or
                       ("率" in idx and not any(x in idx for x in ["流动比率", "速动比率", "周转率"])))
-            row = peer_table.add_row().cells
+            row = table.add_row().cells
             row[0].text = idx
             for i, col in enumerate(compare_df.columns):
                 v = compare_df.loc[idx, col]
@@ -519,42 +719,59 @@ def build_docx_report(company_info: Dict, year: int, llm_analysis: str,
                 else:
                     row[i + 1].text = f"{v:.3f}"
 
-    # AI 分析(渲染 Markdown 简化版)
-    doc.add_heading("🤖 AI 深度分析", level=1)
-    for line in llm_analysis.split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-        if line.startswith("## "):
-            doc.add_heading(line[3:], level=2)
-        elif line.startswith("### "):
-            doc.add_heading(line[4:], level=3)
-        elif line.startswith("- ") or line.startswith("* "):
-            p = doc.add_paragraph(style="List Bullet")
-            _add_runs_with_bold(p, line[2:])
-        else:
-            p = doc.add_paragraph()
-            _add_runs_with_bold(p, line)
+    # 各章节使用的指标分组
+    profit_keys = ["毛利率 (Gross Margin)", "营业利润率 (Operating Margin)",
+                   "净利率 (Net Margin)", "ROA 总资产收益率", "ROE 净资产收益率"]
+    operating_keys = ["总资产周转率", "存货周转率", "应收账款周转率"]
+    solvency_keys = ["流动比率", "速动比率", "资产负债率", "权益乘数 (Equity Multiplier)",
+                     "利息保障倍数"]
 
-    # 插入图表
-    charts_by_cat = {}
-    for ch in charts:
-        charts_by_cat.setdefault(ch["category"], []).append(ch)
+    # ========== 一、公司概览 ==========
+    doc.add_heading("一、公司概览与行业地位", level=1)
+    add_company_info_table()
+    add_md_paragraphs(sections.get("overview", ""))
 
-    for cat, chs in charts_by_cat.items():
-        doc.add_heading(f"📊 {cat}", level=1)
-        for ch in chs:
-            png = fig_to_png_bytes(ch["fig"])
-            if png:
-                doc.add_picture(io.BytesIO(png), width=Inches(6.0))
-                caption = doc.add_paragraph(f"图: {ch['title']}")
-                caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                for run in caption.runs:
-                    run.italic = True
-                    run.font.size = Pt(9)
-            else:
-                p = doc.add_paragraph(f"⚠️ 图表「{ch['title']}」无法渲染")
-                p.italic = True
+    # ========== 二、盈利能力 ==========
+    doc.add_heading("二、盈利能力分析", level=1)
+    add_charts_for("盈利")
+    doc.add_heading("核心盈利指标", level=2)
+    add_ratios_table(profit_keys)
+    add_md_paragraphs(sections.get("profitability", ""))
+
+    # ========== 三、运营效率 ==========
+    doc.add_heading("三、运营效率", level=1)
+    doc.add_heading("运营效率指标", level=2)
+    add_ratios_table(operating_keys)
+    add_md_paragraphs(sections.get("operating", ""))
+
+    # ========== 四、偿债能力 ==========
+    doc.add_heading("四、偿债能力与财务结构", level=1)
+    add_charts_for("偿债")
+    doc.add_heading("偿债能力指标", level=2)
+    add_ratios_table(solvency_keys)
+    add_md_paragraphs(sections.get("solvency", ""))
+
+    # ========== 五、杜邦分析 ==========
+    doc.add_heading("五、杜邦分析:ROE 驱动力拆解", level=1)
+    add_charts_for("杜邦")
+    add_md_paragraphs(sections.get("dupont", ""))
+
+    # ========== 六、历年趋势 ==========
+    doc.add_heading("六、历年趋势与发展轨迹", level=1)
+    add_charts_for("趋势")
+    add_md_paragraphs(sections.get("trend", ""))
+
+    # ========== 七、同行业对标 ==========
+    doc.add_heading("七、同行业对标分析", level=1)
+    if not compare_df.empty:
+        doc.add_heading("同行对照表", level=2)
+        add_peer_table()
+        add_charts_for("同行")
+    add_md_paragraphs(sections.get("peer", ""))
+
+    # ========== 八、综合诊断 ==========
+    doc.add_heading("八、综合诊断与投资视角", level=1)
+    add_md_paragraphs(sections.get("diagnosis", ""))
 
     # 保存
     buf = io.BytesIO()
