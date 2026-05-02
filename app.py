@@ -1,20 +1,18 @@
 """
-财务分析 AI Agent
-Streamlit Web 应用主入口
-
-运行方式:
-    streamlit run app.py
+财务分析 AI Agent - Streamlit 主入口
+支持中英文切换,同行按"行业+规模"自动匹配
+运行: streamlit run app.py
 """
 import streamlit as st
 import pandas as pd
 import sys
 from pathlib import Path
 
-# 确保 utils 模块可被导入
 sys.path.insert(0, str(Path(__file__).parent))
 
 from utils.data_fetcher import (
-    fetch_company_info, fetch_financials, get_peer_suggestions
+    fetch_company_info, fetch_financials,
+    get_peer_suggestions_by_size, search_ticker_by_name, looks_like_ticker
 )
 from utils.ratios import (
     compute_ratios_for_year, compute_multi_year_ratios, dupont_analysis
@@ -25,11 +23,12 @@ from utils.charts import (
     plot_dupont_waterfall, plot_radar
 )
 from utils.report import generate_report
+from utils.i18n import t
 
 
 # ===== 页面配置 =====
 st.set_page_config(
-    page_title="财务分析 Agent",
+    page_title="Financial Analysis Agent",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -58,100 +57,121 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
+# ===== 语言选择 =====
+if "lang" not in st.session_state:
+    st.session_state.lang = "zh"
+
+with st.sidebar:
+    lang_choice = st.radio(
+        "语言 / Language",
+        options=["中文", "English"],
+        index=0 if st.session_state.lang == "zh" else 1,
+        horizontal=True,
+        key="lang_radio",
+    )
+    st.session_state.lang = "zh" if lang_choice == "中文" else "en"
+    st.markdown("---")
+
+LANG = st.session_state.lang
+
+
 # ===== 标题 =====
-st.title("📊 财务分析 AI Agent")
-st.caption("输入公司代码与年份,自动生成比率分析、杜邦分析、趋势、同行对比与中文报告")
+st.title(t("title", LANG))
+st.caption(t("caption", LANG))
+
 
 # ===== 侧边栏 — 输入 =====
 with st.sidebar:
-    st.header("⚙️ 分析参数")
+    st.header(t("sidebar_header", LANG))
 
-    ticker = st.text_input(
-        "公司股票代码",
-        value="AAPL",
-        help="美股直接输入(AAPL),港股加 .HK(0700.HK),A股加 .SS/.SZ(600519.SS)"
-    ).strip().upper()
+    query = st.text_input(
+        t("company_input_label", LANG),
+        value="苹果" if LANG == "zh" else "Apple",
+        placeholder=t("company_input_placeholder", LANG),
+        help=t("company_input_help", LANG),
+    ).strip()
 
-    target_year = st.number_input("目标年份", min_value=2010, max_value=2025, value=2024)
+    ticker = None
+    if query:
+        if looks_like_ticker(query):
+            ticker = query.upper()
+            st.caption(t("using_ticker", LANG, ticker=ticker))
+        else:
+            with st.spinner(t("search_company", LANG)):
+                matches = search_ticker_by_name(query)
+            if not matches:
+                st.error(t("search_no_match", LANG, query=query))
+            elif len(matches) == 1:
+                m = matches[0]
+                ticker = m["ticker"]
+                st.success(t("search_one_match", LANG, name=m["name"], ticker=ticker))
+            else:
+                options = [f"{m['ticker']} — {m['name']} ({m.get('exchange','')})"
+                           for m in matches]
+                choice = st.selectbox(t("search_multi_match", LANG), options, index=0)
+                ticker = choice.split(" — ")[0].strip()
 
-    num_years = st.slider("趋势分析年数", min_value=2, max_value=8, value=5)
+    target_year = st.number_input(t("target_year", LANG),
+                                    min_value=2010, max_value=2025, value=2024)
+    num_years = st.slider(t("trend_years", LANG), min_value=2, max_value=8, value=5)
 
     st.markdown("---")
-    st.subheader("同行公司")
+    st.subheader(t("peer_section", LANG))
     peer_input = st.text_area(
-        "同行代码(每行一个)",
+        t("peer_input_label", LANG),
         value="",
         height=120,
-        placeholder="例如:\nMSFT\nGOOGL\n0700.HK"
+        placeholder=t("peer_input_placeholder", LANG),
     )
-    auto_peers = st.checkbox("自动建议同行(根据行业)", value=True)
+    auto_peers = st.checkbox(t("auto_peers", LANG), value=True)
 
     st.markdown("---")
-    run = st.button("🚀 开始分析", type="primary", use_container_width=True)
+    run = st.button(t("run_button", LANG), type="primary", use_container_width=True)
 
-    with st.expander("ℹ️ 代码格式参考"):
-        st.markdown("""
-        - 美股: `AAPL`、`TSLA`、`MSFT`
-        - 港股: `0700.HK`(腾讯)、`9988.HK`(阿里)
-        - A股(上交所): `600519.SS`(贵州茅台)
-        - A股(深交所): `000858.SZ`(五粮液)
-        - 日股: `7203.T`(丰田)
-        - 英股: `HSBA.L`(汇丰)
-        """)
+    with st.expander(t("input_help_title", LANG)):
+        st.markdown(t("input_help_content", LANG))
 
 
-# ===== 主区域 =====
+# ===== 主区 =====
 if not run:
-    st.info("👈 在左侧输入公司代码与年份,点击「开始分析」")
-    with st.expander("📖 使用说明", expanded=True):
-        st.markdown("""
-        ### 这个 Agent 能做什么?
+    st.info(t("welcome_msg", LANG))
+    with st.expander(t("usage_title", LANG), expanded=True):
+        st.markdown(t("usage_content", LANG))
+    st.stop()
 
-        1. **比率分析** — 盈利、运营、偿债、现金流四大类共 15+ 个核心指标
-        2. **杜邦分析** — ROE 三因素分解(净利率 × 总资产周转率 × 权益乘数)
-        3. **趋势分析** — 多年度指标变化趋势 + 交互式图表
-        4. **同行业比较** — 自动或手动指定同行,输出对比表与雷达图
-        5. **基准分析** — 用通用经验阈值给每个指标打"优秀/良好/一般/偏弱"评级
-        6. **中文报告** — 自动生成可下载的 Markdown 分析报告
-
-        ### 数据来源
-        Yahoo Finance(yfinance)— 覆盖全球主要交易所上市公司,免费、无需 Key。
-
-        ### 局限性
-        - 部分小盘股或非美股公司财报字段可能缺失
-        - 经验基准为通用阈值,不同行业差异较大,请结合同行对比一同看
-        - 当年财报需在 yfinance 已发布后才可分析
-        """)
+if not ticker:
+    st.error(t("no_ticker_error", LANG))
     st.stop()
 
 
 # ===== 执行分析 =====
-with st.spinner(f"📡 正在获取 {ticker} 的数据..."):
+with st.spinner(t("fetching_data", LANG, ticker=ticker)):
     info = fetch_company_info(ticker)
     financials = fetch_financials(ticker)
 
 if "error" in info or financials.get("income", pd.DataFrame()).empty:
-    st.error(f"❌ 无法获取 {ticker} 的数据。请确认代码是否正确(注意后缀 .HK / .SS / .SZ 等)。")
+    st.error(t("fetch_failed", LANG, ticker=ticker))
     if "error" in info:
         st.code(info.get("error"))
     st.stop()
 
-# ===== 公司信息卡片 =====
+
+# ===== 公司卡片 =====
 st.markdown(f"## {info['name']} ({info['ticker']})")
 
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("行业", info.get("sector", "N/A"))
-c2.metric("子行业", (info.get("industry") or "N/A")[:25])
-c3.metric("国家/地区", info.get("country", "N/A"))
+c1.metric(t("metric_sector", LANG), info.get("sector", "N/A"))
+c2.metric(t("metric_industry", LANG), (info.get("industry") or "N/A")[:25])
+c3.metric(t("metric_country", LANG), info.get("country", "N/A"))
 mcap = info.get("market_cap")
 mcap_str = f"{mcap/1e9:.1f}B {info.get('currency', 'USD')}" if mcap else "N/A"
-c4.metric("市值", mcap_str)
+c4.metric(t("metric_market_cap", LANG), mcap_str)
 
 if info.get("summary"):
-    with st.expander("📝 公司简介"):
+    with st.expander(t("company_summary", LANG)):
         st.write(info["summary"])
 
-# ===== 选取目标年份的数据 =====
+# ===== 选取目标年份 =====
 income_df = financials["income"]
 balance_df = financials["balance"]
 cashflow_df = financials["cashflow"]
@@ -159,8 +179,8 @@ cashflow_df = financials["cashflow"]
 cols = sorted(income_df.columns, reverse=True)
 cols_filtered = [c for c in cols if c.year <= target_year]
 if not cols_filtered:
-    st.error(f"⚠️ 未找到 {target_year} 年或更早的财报数据。可用年份: "
-             f"{[c.year for c in cols]}")
+    st.error(t("year_not_found", LANG, target=target_year,
+                avail=str([c.year for c in cols])))
     st.stop()
 
 year_col = cols_filtered[0]
@@ -168,9 +188,10 @@ prev_col = cols_filtered[1] if len(cols_filtered) > 1 else None
 actual_year = year_col.year
 
 if actual_year != target_year:
-    st.warning(f"⚠️ {target_year} 年财报暂不可用,使用最近的 {actual_year} 年数据。")
+    st.warning(t("year_fallback", LANG, target=target_year, actual=actual_year))
 
-# ===== 计算指标 =====
+
+# ===== 计算 =====
 ratios = compute_ratios_for_year(income_df, balance_df, cashflow_df, year_col, prev_col)
 dupont = dupont_analysis(ratios)
 trend_df = compute_multi_year_ratios(financials, target_year, num_years=num_years)
@@ -178,35 +199,41 @@ trend_df = compute_multi_year_ratios(financials, target_year, num_years=num_year
 
 # ===== Tab 布局 =====
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "📈 比率总览", "🔻 杜邦分析", "📉 趋势", "🆚 同行对比", "🎯 基准", "📄 报告"
+    t("tab_overview", LANG), t("tab_dupont", LANG), t("tab_trend", LANG),
+    t("tab_peer", LANG), t("tab_benchmark", LANG), t("tab_report", LANG),
 ])
 
-# ===== Tab 1: 比率总览 =====
+
+# ===== Tab 1 =====
 with tab1:
-    st.subheader(f"{actual_year} 年度核心指标")
+    st.subheader(t("year_metrics", LANG, year=actual_year))
 
     cc1, cc2, cc3, cc4 = st.columns(4)
     cc1.metric("ROE", f"{(ratios.get('ROE 净资产收益率') or 0)*100:.2f}%")
     cc2.metric("ROA", f"{(ratios.get('ROA 总资产收益率') or 0)*100:.2f}%")
-    cc3.metric("净利率", f"{(ratios.get('净利率 (Net Margin)') or 0)*100:.2f}%")
-    cc4.metric("毛利率", f"{(ratios.get('毛利率 (Gross Margin)') or 0)*100:.2f}%")
+    cc3.metric("Net Margin" if LANG == "en" else "净利率",
+                f"{(ratios.get('净利率 (Net Margin)') or 0)*100:.2f}%")
+    cc4.metric("Gross Margin" if LANG == "en" else "毛利率",
+                f"{(ratios.get('毛利率 (Gross Margin)') or 0)*100:.2f}%")
 
     cc1, cc2, cc3, cc4 = st.columns(4)
-    cc1.metric("流动比率", f"{ratios.get('流动比率') or 0:.2f}")
-    cc2.metric("速动比率", f"{ratios.get('速动比率') or 0:.2f}")
-    cc3.metric("资产负债率", f"{(ratios.get('资产负债率') or 0)*100:.2f}%")
-    cc4.metric("总资产周转率", f"{ratios.get('总资产周转率') or 0:.2f}")
+    cc1.metric("Current Ratio" if LANG == "en" else "流动比率",
+                f"{ratios.get('流动比率') or 0:.2f}")
+    cc2.metric("Quick Ratio" if LANG == "en" else "速动比率",
+                f"{ratios.get('速动比率') or 0:.2f}")
+    cc3.metric("Debt/Assets" if LANG == "en" else "资产负债率",
+                f"{(ratios.get('资产负债率') or 0)*100:.2f}%")
+    cc4.metric("Asset Turnover" if LANG == "en" else "总资产周转率",
+                f"{ratios.get('总资产周转率') or 0:.2f}")
 
     st.markdown("---")
-    st.markdown("### 全部比率明细")
-
-    # 把 ratios 整理为表格
+    st.markdown(f"### {t('all_ratios', LANG)}")
     rows = []
     for k, v in ratios.items():
         if k.startswith("_"):
             continue
-        is_pct = any(kw in k for kw in ["率", "ROE", "ROA", "ROIC", "Margin"]) \
-                 and "周转率" not in k and "倍数" not in k
+        is_pct = (any(kw in k for kw in ["ROE", "ROA", "ROIC", "Margin"]) or
+                  ("率" in k and not any(x in k for x in ["流动比率", "速动比率", "周转率"])))
         if v is None:
             display = "N/A"
         elif is_pct:
@@ -215,24 +242,27 @@ with tab1:
             display = f"{v/1e6:.1f}M"
         else:
             display = f"{v:.3f}"
-        rows.append({"指标": k, "数值": display})
+        rows.append({t("col_metric", LANG): k, t("col_value", LANG): display})
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
-# ===== Tab 2: 杜邦分析 =====
+# ===== Tab 2 =====
 with tab2:
-    st.subheader("杜邦分析:ROE 三因素分解")
-    st.latex(r"ROE = \text{净利率} \times \text{总资产周转率} \times \text{权益乘数}")
+    st.subheader(t("dupont_title", LANG))
+    st.latex(r"ROE = \text{Net Margin} \times \text{Asset Turnover} \times \text{Equity Multiplier}")
 
     cc1, cc2, cc3, cc4 = st.columns(4)
-    cc1.metric("净利率", f"{(dupont.get('净利率') or 0)*100:.2f}%")
-    cc2.metric("总资产周转率", f"{dupont.get('总资产周转率') or 0:.2f}")
-    cc3.metric("权益乘数", f"{dupont.get('权益乘数') or 0:.2f}")
-    cc4.metric("ROE (杜邦)", f"{(dupont.get('ROE (杜邦计算)') or 0)*100:.2f}%")
+    cc1.metric("Net Margin" if LANG == "en" else "净利率",
+                f"{(dupont.get('净利率') or 0)*100:.2f}%")
+    cc2.metric("Asset Turnover" if LANG == "en" else "总资产周转率",
+                f"{dupont.get('总资产周转率') or 0:.2f}")
+    cc3.metric("Equity Multiplier" if LANG == "en" else "权益乘数",
+                f"{dupont.get('权益乘数') or 0:.2f}")
+    cc4.metric("ROE (DuPont)" if LANG == "en" else "ROE (杜邦)",
+                f"{(dupont.get('ROE (杜邦计算)') or 0)*100:.2f}%")
 
     st.plotly_chart(plot_dupont_waterfall(dupont, actual_year), use_container_width=True)
 
-    # 多年杜邦趋势
     if trend_df is not None and not trend_df.empty:
         dupont_history = {}
         for col in trend_df.columns:
@@ -247,43 +277,29 @@ with tab2:
                         use_container_width=True)
 
 
-# ===== Tab 3: 趋势 =====
+# ===== Tab 3 =====
 with tab3:
-    st.subheader(f"近 {len(trend_df.columns) if not trend_df.empty else 0} 年趋势")
+    n = len(trend_df.columns) if not trend_df.empty else 0
+    st.subheader(t("trend_title", LANG, n=n))
 
     if trend_df.empty:
-        st.warning("趋势数据不足")
+        st.warning(t("trend_data_insufficient", LANG))
     else:
-        # 盈利能力趋势
-        st.plotly_chart(
-            plot_trend(trend_df,
-                       ["毛利率 (Gross Margin)", "营业利润率 (Operating Margin)",
-                        "净利率 (Net Margin)"],
-                       title="盈利能力趋势"),
-            use_container_width=True
-        )
+        st.plotly_chart(plot_trend(trend_df,
+            ["毛利率 (Gross Margin)", "营业利润率 (Operating Margin)", "净利率 (Net Margin)"],
+            title=t("profitability_trend", LANG)), use_container_width=True)
+        st.plotly_chart(plot_trend(trend_df,
+            ["ROE 净资产收益率", "ROA 总资产收益率"],
+            title=t("return_trend", LANG)), use_container_width=True)
+        st.plotly_chart(plot_trend(trend_df,
+            ["流动比率", "速动比率", "资产负债率"],
+            title=t("solvency_trend", LANG)), use_container_width=True)
 
-        # 回报趋势
-        st.plotly_chart(
-            plot_trend(trend_df, ["ROE 净资产收益率", "ROA 总资产收益率"],
-                       title="股东回报趋势"),
-            use_container_width=True
-        )
-
-        # 偿债能力趋势
-        st.plotly_chart(
-            plot_trend(trend_df, ["流动比率", "速动比率", "资产负债率"],
-                       title="偿债能力趋势"),
-            use_container_width=True
-        )
-
-        # 数据表
-        with st.expander("📋 趋势数据明细"):
+        with st.expander(t("trend_details", LANG)):
             display_df = trend_df.copy()
-            # 格式化
             for idx in display_df.index:
-                is_pct = any(kw in idx for kw in ["率", "ROE", "ROA", "Margin"]) \
-                         and "周转率" not in idx and "倍数" not in idx
+                is_pct = (any(kw in idx for kw in ["ROE", "ROA", "Margin"]) or
+                          ("率" in idx and not any(x in idx for x in ["流动比率", "速动比率", "周转率"])))
                 for col in display_df.columns:
                     v = display_df.loc[idx, col]
                     if pd.isna(v):
@@ -295,27 +311,66 @@ with tab3:
             st.dataframe(display_df, use_container_width=True)
 
 
-# ===== Tab 4: 同行对比 =====
+# ===== Tab 4: 同行对比(行业 + 规模匹配) =====
 with tab4:
-    st.subheader("同行业比较")
+    st.subheader(t("peer_section_title", LANG))
 
-    # 收集同行 ticker
-    peer_list = [p.strip().upper() for p in peer_input.split("\n") if p.strip()]
+    # 解析手动输入的同行
+    raw_peers = [p.strip() for p in peer_input.split("\n") if p.strip()]
+    peer_list = []
+    failed_peers = []
+    for p in raw_peers:
+        if looks_like_ticker(p):
+            peer_list.append(p.upper())
+        else:
+            matches = search_ticker_by_name(p)
+            if matches:
+                peer_list.append(matches[0]["ticker"])
+            else:
+                failed_peers.append(p)
+    if failed_peers:
+        st.warning(t("peer_unrecognized", LANG, names=", ".join(failed_peers)))
+
+    # 自动建议(行业 + 规模)
     if not peer_list and auto_peers:
-        peer_list = get_peer_suggestions(info.get("sector", ""), exclude=ticker)[:4]
+        spinner_msg = "Matching peers by industry & size..." if LANG == "en" else "正在按行业 + 规模匹配同行..."
+        with st.spinner(spinner_msg):
+            suggested = get_peer_suggestions_by_size(
+                sector=info.get("sector", ""),
+                target_market_cap=info.get("market_cap"),
+                exclude=ticker,
+                n=4,
+            )
+        peer_list = [s["ticker"] for s in suggested]
+
         if peer_list:
-            st.info(f"🤖 已自动选取同行: {', '.join(peer_list)}")
+            peers_with_size = []
+            for s in suggested:
+                tk = s["ticker"]
+                cap = s.get("market_cap")
+                if cap:
+                    if cap > 1e12:
+                        size_str = f"{cap/1e12:.2f}T"
+                    elif cap > 1e9:
+                        size_str = f"{cap/1e9:.1f}B"
+                    else:
+                        size_str = f"{cap/1e6:.0f}M"
+                    peers_with_size.append(f"{tk} ({size_str})")
+                else:
+                    peers_with_size.append(tk)
+            st.info(t("auto_peer_msg", LANG,
+                      sector=info.get("sector", "N/A"),
+                      peers=", ".join(peers_with_size)))
 
     if not peer_list:
-        st.warning("请在侧边栏添加至少一个同行公司,或勾选「自动建议」")
+        st.warning(t("peer_warning", LANG))
     else:
-        with st.spinner(f"获取同行数据 ({len(peer_list)} 家)..."):
+        with st.spinner(t("fetching_peers", LANG, n=len(peer_list))):
             compare_df = compare_with_peers(ticker, peer_list, target_year)
 
         if compare_df.empty or len(compare_df.columns) < 2:
-            st.error("同行数据获取失败,请检查代码")
+            st.error(t("peer_fetch_failed", LANG))
         else:
-            # 关键指标对比图
             key_metrics_for_chart = [
                 "净利率 (Net Margin)", "ROE 净资产收益率",
                 "ROA 总资产收益率", "资产负债率"
@@ -325,19 +380,17 @@ with tab4:
                     st.plotly_chart(plot_peer_comparison(compare_df, m),
                                     use_container_width=True)
 
-            # 雷达图
             radar_metrics = ["净利率 (Net Margin)", "ROE 净资产收益率",
                              "ROA 总资产收益率", "总资产周转率",
                              "毛利率 (Gross Margin)", "流动比率"]
             st.plotly_chart(plot_radar(compare_df, radar_metrics),
                             use_container_width=True)
 
-            # 详细对比表
-            with st.expander("📋 同行对比明细表"):
+            with st.expander(t("peer_details", LANG)):
                 display = compare_df.copy()
                 for idx in display.index:
-                    is_pct = any(kw in idx for kw in ["率", "ROE", "ROA", "Margin"]) \
-                             and "周转率" not in idx and "倍数" not in idx
+                    is_pct = (any(kw in idx for kw in ["ROE", "ROA", "Margin"]) or
+                              ("率" in idx and not any(x in idx for x in ["流动比率", "速动比率", "周转率"])))
                     for col in display.columns:
                         v = display.loc[idx, col]
                         if pd.isna(v):
@@ -348,25 +401,23 @@ with tab4:
                             display.loc[idx, col] = f"{v:.3f}"
                 st.dataframe(display, use_container_width=True)
 
-            # 保存到 session 供报告使用
             st.session_state["compare_df"] = compare_df
 
 
-# ===== Tab 5: 基准 =====
+# ===== Tab 5 =====
 with tab5:
-    st.subheader("基准分析(经验阈值)")
-    st.caption("⚠️ 通用经验阈值,行业差异大,请配合同行对比综合判断")
+    st.subheader(t("benchmark_title", LANG))
+    st.caption(t("benchmark_caption", LANG))
 
     bench_df = benchmark_analysis(ratios)
     if bench_df.empty:
-        st.warning("无可对比的指标")
+        st.warning(t("no_benchmark_data", LANG))
     else:
-        # 格式化表格显示
         display_bench = bench_df.copy()
         for idx, row in display_bench.iterrows():
             metric = row["指标"]
-            is_pct = any(kw in metric for kw in ["率", "Margin"]) \
-                     and "周转率" not in metric and "倍数" not in metric
+            is_pct = ("Margin" in metric or
+                      ("率" in metric and not any(x in metric for x in ["流动比率", "速动比率", "周转率", "倍数"])))
             for col in ["公司值", "优秀基准", "良好基准", "一般基准"]:
                 v = row[col]
                 if pd.isna(v) or v is None:
@@ -378,9 +429,9 @@ with tab5:
         st.dataframe(display_bench, use_container_width=True, hide_index=True)
 
 
-# ===== Tab 6: 报告 =====
+# ===== Tab 6 =====
 with tab6:
-    st.subheader("📄 中文分析报告")
+    st.subheader(t("report_title", LANG))
     compare_df = st.session_state.get("compare_df", pd.DataFrame())
     report_md = generate_report(info, ratios, dupont, trend_df, compare_df, actual_year)
 
@@ -388,9 +439,9 @@ with tab6:
 
     st.markdown("---")
     st.download_button(
-        "📥 下载报告 (Markdown)",
+        t("download_report", LANG),
         data=report_md,
-        file_name=f"{ticker}_{actual_year}_财务分析报告.md",
+        file_name=t("report_filename", LANG, ticker=ticker, year=actual_year),
         mime="text/markdown",
         use_container_width=True,
     )
