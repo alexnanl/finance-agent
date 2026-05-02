@@ -477,7 +477,7 @@ with tab5:
         st.dataframe(display_bench, use_container_width=True, hide_index=True)
 
 
-# ===== Tab 6 - 增强报告(LLM 分析 + 图表 + 多格式下载) =====
+# ===== Tab 6 - 增强报告(按章节:数据/图表 → AI 分析) =====
 with tab6:
     st.subheader(t("report_title", LANG))
 
@@ -490,21 +490,19 @@ with tab6:
                           else "🔑 OpenAI API Key"):
             api_key = st.text_input("API Key", type="password", key="report_api_key")
 
-    # 缓存 key:基于公司+年份+同行,避免重复调用 LLM
+    # 缓存 key
     cache_key = f"{ticker}_{actual_year}_{len(compare_df.columns) if not compare_df.empty else 0}"
 
     if "report_cache" not in st.session_state:
         st.session_state.report_cache = {}
-
     cached = st.session_state.report_cache.get(cache_key)
 
-    # 自动生成增强报告
     from utils.report_builder import (
-        collect_all_charts, generate_llm_analysis,
+        collect_all_charts, generate_section_analyses,
         build_html_report, build_docx_report, build_pdf_report
     )
 
-    # === 第一阶段:收集图表(快) ===
+    # === 第一阶段:收集图表 ===
     if cached is None or "charts" not in cached:
         with st.spinner("🎨 收集图表..." if LANG == "zh" else "🎨 Collecting charts..."):
             charts = collect_all_charts(ratios, dupont, trend_df, compare_df, actual_year)
@@ -513,65 +511,173 @@ with tab6:
         cached["charts"] = charts
         st.session_state.report_cache[cache_key] = cached
 
-    # === 第二阶段:LLM 生成深度分析(慢) ===
-    if "llm_analysis" not in cached:
+    # === 第二阶段:LLM 生成分章节分析 ===
+    if "sections" not in cached:
         if not api_key:
-            st.warning("⚠️ 未配置 OpenAI API Key,将使用基础规则报告(无 AI 深度解读)。"
+            st.warning("⚠️ 未配置 OpenAI API Key,使用基础规则报告(无 AI 深度解读)。"
                        "在 Streamlit Cloud Settings → Secrets 添加 `OPENAI_API_KEY`。"
                        if LANG == "zh" else
-                       "⚠️ No API Key — falling back to rule-based report.")
-            cached["llm_analysis"] = generate_report(info, ratios, dupont,
-                                                      trend_df, compare_df, actual_year)
+                       "⚠️ No API Key — using rule-based fallback.")
+            # 兜底:用规则报告填充
+            fallback = generate_report(info, ratios, dupont, trend_df, compare_df, actual_year)
+            cached["sections"] = {
+                "overview": "本公司基本信息见上表。",
+                "profitability": fallback,
+                "operating": "", "solvency": "", "dupont": "",
+                "trend": "", "peer": "", "diagnosis": "",
+            }
             cached["is_llm"] = False
         else:
-            spinner_msg = "🤖 AI 正在生成深度分析报告(约 10-30 秒)..." if LANG == "zh" \
-                          else "🤖 Generating AI analysis (10-30s)..."
+            spinner_msg = ("🤖 AI 正在为各章节生成深度分析(约 15-40 秒)..."
+                           if LANG == "zh" else "🤖 Generating AI analysis (15-40s)...")
             with st.spinner(spinner_msg):
                 try:
-                    analysis = generate_llm_analysis(
+                    sections = generate_section_analyses(
                         info, ratios, dupont, trend_df, compare_df,
                         actual_year, api_key,
                     )
-                    cached["llm_analysis"] = analysis
+                    cached["sections"] = sections
                     cached["is_llm"] = True
                 except Exception as e:
                     st.error(f"AI 分析生成失败: {type(e).__name__}: {str(e)[:200]}")
-                    st.info("回退到规则报告" if LANG == "zh" else "Falling back to rule-based")
-                    cached["llm_analysis"] = generate_report(
-                        info, ratios, dupont, trend_df, compare_df, actual_year)
+                    fallback = generate_report(info, ratios, dupont, trend_df, compare_df, actual_year)
+                    cached["sections"] = {
+                        "overview": fallback, "profitability": "",
+                        "operating": "", "solvency": "", "dupont": "",
+                        "trend": "", "peer": "", "diagnosis": "",
+                    }
                     cached["is_llm"] = False
         st.session_state.report_cache[cache_key] = cached
 
-    # === 渲染报告(在线展示)===
-    if cached.get("is_llm"):
-        st.success("✅ AI 深度分析报告已生成" if LANG == "zh" else "✅ AI report ready")
-    else:
-        st.info("ℹ️ 当前为规则模板报告" if LANG == "zh" else "ℹ️ Rule-based report")
+    sections = cached["sections"]
+    charts = cached["charts"]
 
-    # 重新生成按钮
+    # === UI 头部 ===
     col_a, col_b = st.columns([3, 1])
+    with col_a:
+        if cached.get("is_llm"):
+            st.success("✅ AI 深度分析报告已生成" if LANG == "zh" else "✅ AI report ready")
+        else:
+            st.info("ℹ️ 当前为规则模板报告" if LANG == "zh" else "ℹ️ Rule-based report")
     with col_b:
         if st.button("🔄 重新生成" if LANG == "zh" else "🔄 Regenerate",
                       use_container_width=True, key="regen_report"):
             del st.session_state.report_cache[cache_key]
             st.rerun()
 
-    # 显示分析正文
-    st.markdown("### 📝 分析正文" if LANG == "zh" else "### 📝 Analysis")
-    with st.container():
-        st.markdown(cached["llm_analysis"])
+    st.markdown("---")
 
-    # 显示图表(分类)
-    charts = cached["charts"]
-    charts_by_cat = {}
-    for ch in charts:
-        charts_by_cat.setdefault(ch["category"], []).append(ch)
+    # ========== 内联渲染:按章节"数据/图表 → AI 分析" ==========
 
-    for cat, chs in charts_by_cat.items():
-        st.markdown(f"### 📊 {cat}")
-        for ch in chs:
-            st.plotly_chart(ch["fig"], use_container_width=True,
-                            key=f"report_{ch['id']}")
+    # 辅助:渲染特定 anchor 的所有图表
+    def _render_anchor_charts(anchor):
+        for ch in charts:
+            if ch.get("section_anchor") == anchor:
+                st.plotly_chart(ch["fig"], use_container_width=True,
+                                key=f"sec_{ch['id']}")
+
+    # 辅助:渲染指定指标子集的小表格
+    def _render_subset_table(keys):
+        rows = []
+        for k in keys:
+            v = ratios.get(k)
+            if v is None and k not in ratios:
+                continue
+            is_pct = (any(kw in k for kw in ["ROE", "ROA", "ROIC", "Margin"]) or
+                      ("率" in k and not any(x in k for x in ["流动比率", "速动比率", "周转率"])))
+            if v is None:
+                disp = "—"
+            elif is_pct:
+                disp = f"{v*100:.2f}%"
+            elif abs(v) > 1e6:
+                disp = f"{v/1e6:.1f}M"
+            else:
+                disp = f"{v:.3f}"
+            rows.append({"指标": k, "数值": disp})
+        if rows:
+            st.table(pd.DataFrame(rows).set_index("指标"))
+
+    profit_keys = ["毛利率 (Gross Margin)", "营业利润率 (Operating Margin)",
+                   "净利率 (Net Margin)", "ROA 总资产收益率", "ROE 净资产收益率"]
+    operating_keys = ["总资产周转率", "存货周转率", "应收账款周转率"]
+    solvency_keys = ["流动比率", "速动比率", "资产负债率", "权益乘数 (Equity Multiplier)",
+                     "利息保障倍数"]
+
+    # ===== 一、公司概览 =====
+    st.markdown("## 一、公司概览与行业地位")
+    info_rows = [
+        ("公司名称", info.get("name", "—")),
+        ("股票代码", info.get("ticker", "—")),
+        ("行业 / 子行业", f"{info.get('sector', '—')} / {info.get('industry', '—')}"),
+        ("国家/地区", info.get("country", "—")),
+        ("市值", f"{info.get('market_cap', 0)/1e9:.1f}B {info.get('currency', 'USD')}"
+                  if info.get("market_cap") else "—"),
+    ]
+    st.table(pd.DataFrame(info_rows, columns=["项目", "内容"]).set_index("项目"))
+    if sections.get("overview"):
+        st.markdown(sections["overview"])
+
+    # ===== 二、盈利能力 =====
+    st.markdown("## 二、盈利能力分析")
+    _render_anchor_charts("盈利")
+    st.markdown("**核心盈利指标**")
+    _render_subset_table(profit_keys)
+    if sections.get("profitability"):
+        st.markdown(sections["profitability"])
+
+    # ===== 三、运营效率 =====
+    st.markdown("## 三、运营效率")
+    st.markdown("**运营效率指标**")
+    _render_subset_table(operating_keys)
+    if sections.get("operating"):
+        st.markdown(sections["operating"])
+
+    # ===== 四、偿债能力 =====
+    st.markdown("## 四、偿债能力与财务结构")
+    _render_anchor_charts("偿债")
+    st.markdown("**偿债能力指标**")
+    _render_subset_table(solvency_keys)
+    if sections.get("solvency"):
+        st.markdown(sections["solvency"])
+
+    # ===== 五、杜邦分析 =====
+    st.markdown("## 五、杜邦分析:ROE 驱动力拆解")
+    _render_anchor_charts("杜邦")
+    if sections.get("dupont"):
+        st.markdown(sections["dupont"])
+
+    # ===== 六、历年趋势 =====
+    st.markdown("## 六、历年趋势与发展轨迹")
+    _render_anchor_charts("趋势")
+    if sections.get("trend"):
+        st.markdown(sections["trend"])
+
+    # ===== 七、同行业对标 =====
+    st.markdown("## 七、同行业对标分析")
+    if not compare_df.empty:
+        st.markdown("**同行对照表**")
+        # 简单对照表
+        compare_display = compare_df.copy().astype(object)
+        for idx in compare_display.index:
+            is_pct = (any(kw in idx for kw in ["ROE", "ROA", "Margin"]) or
+                      ("率" in idx and not any(x in idx for x in ["流动比率", "速动比率", "周转率"])))
+            for col in compare_display.columns:
+                v = compare_df.loc[idx, col]
+                if pd.isna(v):
+                    compare_display.loc[idx, col] = "—"
+                elif is_pct:
+                    compare_display.loc[idx, col] = f"{v*100:.2f}%"
+                else:
+                    compare_display.loc[idx, col] = f"{v:.3f}"
+        st.dataframe(compare_display, use_container_width=True)
+        _render_anchor_charts("同行")
+    if sections.get("peer"):
+        st.markdown(sections["peer"])
+
+    # ===== 八、综合诊断 =====
+    st.markdown("## 八、综合诊断与投资视角")
+    if sections.get("diagnosis"):
+        st.markdown(sections["diagnosis"])
 
     # === 下载选项 ===
     st.markdown("---")
@@ -579,10 +685,23 @@ with tab6:
 
     fmt_col1, fmt_col2, fmt_col3, fmt_col4 = st.columns(4)
 
-    # Markdown(总是可用)
+    # 拼接 Markdown 版本(章节 + 文字)
+    titles_md = [
+        ("一、公司概览与行业地位", "overview"),
+        ("二、盈利能力分析", "profitability"),
+        ("三、运营效率", "operating"),
+        ("四、偿债能力与财务结构", "solvency"),
+        ("五、杜邦分析:ROE 驱动力拆解", "dupont"),
+        ("六、历年趋势与发展轨迹", "trend"),
+        ("七、同行业对标分析", "peer"),
+        ("八、综合诊断与投资视角", "diagnosis"),
+    ]
+    md_content = f"# {info['name']} ({ticker}) {actual_year} 年度财务分析报告\n\n"
+    for title, key in titles_md:
+        body = sections.get(key, "").strip()
+        md_content += f"## {title}\n\n{body if body else '(本章节暂无分析)'}\n\n"
+
     with fmt_col1:
-        md_content = f"# {info['name']} ({ticker}) {actual_year} 年度财务分析报告\n\n"
-        md_content += cached["llm_analysis"]
         st.download_button(
             "📄 Markdown",
             data=md_content,
@@ -591,10 +710,9 @@ with tab6:
             use_container_width=True,
         )
 
-    # HTML(嵌入图表)
     with fmt_col2:
         try:
-            html = build_html_report(info, actual_year, cached["llm_analysis"],
+            html = build_html_report(info, actual_year, sections,
                                        charts, ratios, compare_df)
             st.download_button(
                 "🌐 HTML",
@@ -608,10 +726,9 @@ with tab6:
                        help=f"{type(e).__name__}: {str(e)[:100]}",
                        use_container_width=True)
 
-    # DOCX
     with fmt_col3:
         try:
-            docx_bytes = build_docx_report(info, actual_year, cached["llm_analysis"],
+            docx_bytes = build_docx_report(info, actual_year, sections,
                                              charts, ratios, compare_df)
             st.download_button(
                 "📝 Word",
@@ -625,10 +742,9 @@ with tab6:
                        help=f"{type(e).__name__}: {str(e)[:100]}",
                        use_container_width=True)
 
-    # PDF(可能因依赖问题失败)
     with fmt_col4:
         try:
-            html_for_pdf = build_html_report(info, actual_year, cached["llm_analysis"],
+            html_for_pdf = build_html_report(info, actual_year, sections,
                                                charts, ratios, compare_df)
             pdf_bytes = build_pdf_report(html_for_pdf)
             if pdf_bytes:
@@ -641,13 +757,13 @@ with tab6:
                 )
             else:
                 st.button("📑 PDF (不可用)", disabled=True,
-                           help="服务器缺少 weasyprint 依赖,请改用 HTML 后在浏览器打印为 PDF",
+                           help="服务器缺少 weasyprint,请改用 HTML 后在浏览器打印为 PDF",
                            use_container_width=True)
         except Exception as e:
             st.button("📑 PDF (失败)", disabled=True,
                        help=f"{type(e).__name__}: {str(e)[:100]}",
                        use_container_width=True)
 
-    st.caption("💡 提示:HTML 文件可以在浏览器中按 Ctrl+P 直接打印为 PDF,中文显示更稳定。"
+    st.caption("💡 提示:HTML 文件可以在浏览器中按 Ctrl+P 直接打印为 PDF,中文显示最稳定。"
                 if LANG == "zh" else
                 "💡 Tip: HTML files can be printed to PDF via Ctrl+P in your browser.")
