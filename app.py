@@ -75,9 +75,39 @@ with st.sidebar:
 LANG = st.session_state.lang
 
 
+# ===== 模式选择 =====
+if "mode" not in st.session_state:
+    st.session_state.mode = "ai"  # 默认 AI 对话
+
+with st.sidebar:
+    mode_label = "模式 / Mode" if LANG == "zh" else "Mode"
+    mode_options = (["🤖 AI 对话", "📊 经典分析"] if LANG == "zh"
+                    else ["🤖 AI Chat", "📊 Classic"])
+    mode_choice = st.radio(
+        mode_label, options=mode_options,
+        index=0 if st.session_state.mode == "ai" else 1,
+        key="mode_radio",
+    )
+    st.session_state.mode = "ai" if "AI" in mode_choice or "🤖" in mode_choice else "classic"
+    st.markdown("---")
+
+MODE = st.session_state.mode
+
+
 # ===== 标题 =====
 st.title(t("title", LANG))
 st.caption(t("caption", LANG))
+
+
+# ===== AI 对话模式 - 直接渲染聊天页面后退出 =====
+if MODE == "ai":
+    from utils.chat_page import render_chat_page
+    render_chat_page(lang=LANG)
+    st.stop()
+
+
+# ===== 经典分析模式(下面是原有逻辑) =====
+
 
 
 # ===== 侧边栏 — 输入 =====
@@ -114,6 +144,10 @@ with st.sidebar:
     target_year = st.number_input(t("target_year", LANG),
                                     min_value=2010, max_value=2025, value=2024)
     num_years = st.slider(t("trend_years", LANG), min_value=2, max_value=8, value=5)
+    if LANG == "zh":
+        st.caption("💡 yfinance 通常仅提供近 4 年年报,实际显示年数可能少于此设置")
+    else:
+        st.caption("💡 yfinance usually provides ~4 years of annual data; actual range may be shorter")
 
     st.markdown("---")
     st.subheader(t("peer_section", LANG))
@@ -282,6 +316,16 @@ with tab3:
     n = len(trend_df.columns) if not trend_df.empty else 0
     st.subheader(t("trend_title", LANG, n=n))
 
+    # 提示用户实际可用年数 vs 请求的年数
+    if n < num_years:
+        if LANG == "zh":
+            st.info(f"ℹ️ 你请求 {num_years} 年的数据,但 Yahoo Finance 对 {ticker} "
+                    f"实际仅提供 {n} 年的年报。这是数据源的限制,不是代码问题。")
+        else:
+            st.info(f"ℹ️ You requested {num_years} years, but Yahoo Finance only "
+                    f"provides {n} years of annual reports for {ticker}. "
+                    f"This is a data-source limitation.")
+
     if trend_df.empty:
         st.warning(t("trend_data_insufficient", LANG))
     else:
@@ -433,19 +477,177 @@ with tab5:
         st.dataframe(display_bench, use_container_width=True, hide_index=True)
 
 
-# ===== Tab 6 =====
+# ===== Tab 6 - 增强报告(LLM 分析 + 图表 + 多格式下载) =====
 with tab6:
     st.subheader(t("report_title", LANG))
+
     compare_df = st.session_state.get("compare_df", pd.DataFrame())
-    report_md = generate_report(info, ratios, dupont, trend_df, compare_df, actual_year)
 
-    st.markdown(report_md)
+    # 检查 API Key
+    api_key = st.secrets.get("OPENAI_API_KEY", None) if hasattr(st, "secrets") else None
+    if not api_key:
+        with st.expander("🔑 OpenAI API Key (输入以启用 AI 深度分析)" if LANG == "zh"
+                          else "🔑 OpenAI API Key"):
+            api_key = st.text_input("API Key", type="password", key="report_api_key")
 
-    st.markdown("---")
-    st.download_button(
-        t("download_report", LANG),
-        data=report_md,
-        file_name=t("report_filename", LANG, ticker=ticker, year=actual_year),
-        mime="text/markdown",
-        use_container_width=True,
+    # 缓存 key:基于公司+年份+同行,避免重复调用 LLM
+    cache_key = f"{ticker}_{actual_year}_{len(compare_df.columns) if not compare_df.empty else 0}"
+
+    if "report_cache" not in st.session_state:
+        st.session_state.report_cache = {}
+
+    cached = st.session_state.report_cache.get(cache_key)
+
+    # 自动生成增强报告
+    from utils.report_builder import (
+        collect_all_charts, generate_llm_analysis,
+        build_html_report, build_docx_report, build_pdf_report
     )
+
+    # === 第一阶段:收集图表(快) ===
+    if cached is None or "charts" not in cached:
+        with st.spinner("🎨 收集图表..." if LANG == "zh" else "🎨 Collecting charts..."):
+            charts = collect_all_charts(ratios, dupont, trend_df, compare_df, actual_year)
+        if cached is None:
+            cached = {}
+        cached["charts"] = charts
+        st.session_state.report_cache[cache_key] = cached
+
+    # === 第二阶段:LLM 生成深度分析(慢) ===
+    if "llm_analysis" not in cached:
+        if not api_key:
+            st.warning("⚠️ 未配置 OpenAI API Key,将使用基础规则报告(无 AI 深度解读)。"
+                       "在 Streamlit Cloud Settings → Secrets 添加 `OPENAI_API_KEY`。"
+                       if LANG == "zh" else
+                       "⚠️ No API Key — falling back to rule-based report.")
+            cached["llm_analysis"] = generate_report(info, ratios, dupont,
+                                                      trend_df, compare_df, actual_year)
+            cached["is_llm"] = False
+        else:
+            spinner_msg = "🤖 AI 正在生成深度分析报告(约 10-30 秒)..." if LANG == "zh" \
+                          else "🤖 Generating AI analysis (10-30s)..."
+            with st.spinner(spinner_msg):
+                try:
+                    analysis = generate_llm_analysis(
+                        info, ratios, dupont, trend_df, compare_df,
+                        actual_year, api_key,
+                    )
+                    cached["llm_analysis"] = analysis
+                    cached["is_llm"] = True
+                except Exception as e:
+                    st.error(f"AI 分析生成失败: {type(e).__name__}: {str(e)[:200]}")
+                    st.info("回退到规则报告" if LANG == "zh" else "Falling back to rule-based")
+                    cached["llm_analysis"] = generate_report(
+                        info, ratios, dupont, trend_df, compare_df, actual_year)
+                    cached["is_llm"] = False
+        st.session_state.report_cache[cache_key] = cached
+
+    # === 渲染报告(在线展示)===
+    if cached.get("is_llm"):
+        st.success("✅ AI 深度分析报告已生成" if LANG == "zh" else "✅ AI report ready")
+    else:
+        st.info("ℹ️ 当前为规则模板报告" if LANG == "zh" else "ℹ️ Rule-based report")
+
+    # 重新生成按钮
+    col_a, col_b = st.columns([3, 1])
+    with col_b:
+        if st.button("🔄 重新生成" if LANG == "zh" else "🔄 Regenerate",
+                      use_container_width=True, key="regen_report"):
+            del st.session_state.report_cache[cache_key]
+            st.rerun()
+
+    # 显示分析正文
+    st.markdown("### 📝 分析正文" if LANG == "zh" else "### 📝 Analysis")
+    with st.container():
+        st.markdown(cached["llm_analysis"])
+
+    # 显示图表(分类)
+    charts = cached["charts"]
+    charts_by_cat = {}
+    for ch in charts:
+        charts_by_cat.setdefault(ch["category"], []).append(ch)
+
+    for cat, chs in charts_by_cat.items():
+        st.markdown(f"### 📊 {cat}")
+        for ch in chs:
+            st.plotly_chart(ch["fig"], use_container_width=True,
+                            key=f"report_{ch['id']}")
+
+    # === 下载选项 ===
+    st.markdown("---")
+    st.markdown("### 📥 下载报告" if LANG == "zh" else "### 📥 Download Report")
+
+    fmt_col1, fmt_col2, fmt_col3, fmt_col4 = st.columns(4)
+
+    # Markdown(总是可用)
+    with fmt_col1:
+        md_content = f"# {info['name']} ({ticker}) {actual_year} 年度财务分析报告\n\n"
+        md_content += cached["llm_analysis"]
+        st.download_button(
+            "📄 Markdown",
+            data=md_content,
+            file_name=f"{ticker}_{actual_year}_财务分析.md",
+            mime="text/markdown",
+            use_container_width=True,
+        )
+
+    # HTML(嵌入图表)
+    with fmt_col2:
+        try:
+            html = build_html_report(info, actual_year, cached["llm_analysis"],
+                                       charts, ratios, compare_df)
+            st.download_button(
+                "🌐 HTML",
+                data=html.encode("utf-8"),
+                file_name=f"{ticker}_{actual_year}_财务分析.html",
+                mime="text/html",
+                use_container_width=True,
+            )
+        except Exception as e:
+            st.button("🌐 HTML (失败)", disabled=True,
+                       help=f"{type(e).__name__}: {str(e)[:100]}",
+                       use_container_width=True)
+
+    # DOCX
+    with fmt_col3:
+        try:
+            docx_bytes = build_docx_report(info, actual_year, cached["llm_analysis"],
+                                             charts, ratios, compare_df)
+            st.download_button(
+                "📝 Word",
+                data=docx_bytes,
+                file_name=f"{ticker}_{actual_year}_财务分析.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True,
+            )
+        except Exception as e:
+            st.button("📝 Word (失败)", disabled=True,
+                       help=f"{type(e).__name__}: {str(e)[:100]}",
+                       use_container_width=True)
+
+    # PDF(可能因依赖问题失败)
+    with fmt_col4:
+        try:
+            html_for_pdf = build_html_report(info, actual_year, cached["llm_analysis"],
+                                               charts, ratios, compare_df)
+            pdf_bytes = build_pdf_report(html_for_pdf)
+            if pdf_bytes:
+                st.download_button(
+                    "📑 PDF",
+                    data=pdf_bytes,
+                    file_name=f"{ticker}_{actual_year}_财务分析.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+            else:
+                st.button("📑 PDF (不可用)", disabled=True,
+                           help="服务器缺少 weasyprint 依赖,请改用 HTML 后在浏览器打印为 PDF",
+                           use_container_width=True)
+        except Exception as e:
+            st.button("📑 PDF (失败)", disabled=True,
+                       help=f"{type(e).__name__}: {str(e)[:100]}",
+                       use_container_width=True)
+
+    st.caption("💡 提示:HTML 文件可以在浏览器中按 Ctrl+P 直接打印为 PDF,中文显示更稳定。"
+                if LANG == "zh" else
+                "💡 Tip: HTML files can be printed to PDF via Ctrl+P in your browser.")
