@@ -296,18 +296,20 @@ with tab3:
             title=t("solvency_trend", LANG)), use_container_width=True)
 
         with st.expander(t("trend_details", LANG)):
-            display_df = trend_df.copy()
-            for idx in display_df.index:
+            def fmt_trend_cell(v, idx):
                 is_pct = (any(kw in idx for kw in ["ROE", "ROA", "Margin"]) or
                           ("率" in idx and not any(x in idx for x in ["流动比率", "速动比率", "周转率"])))
+                if pd.isna(v):
+                    return "—"
+                elif is_pct:
+                    return f"{v*100:.2f}%"
+                else:
+                    return f"{v:.3f}"
+
+            display_df = trend_df.copy().astype(object)
+            for idx in display_df.index:
                 for col in display_df.columns:
-                    v = display_df.loc[idx, col]
-                    if pd.isna(v):
-                        display_df.loc[idx, col] = "—"
-                    elif is_pct:
-                        display_df.loc[idx, col] = f"{v*100:.2f}%"
-                    else:
-                        display_df.loc[idx, col] = f"{v:.3f}"
+                    display_df.at[idx, col] = fmt_trend_cell(trend_df.loc[idx, col], idx)
             st.dataframe(display_df, use_container_width=True)
 
 
@@ -387,18 +389,20 @@ with tab4:
                             use_container_width=True)
 
             with st.expander(t("peer_details", LANG)):
-                display = compare_df.copy()
-                for idx in display.index:
+                def fmt_peer_cell(v, idx):
                     is_pct = (any(kw in idx for kw in ["ROE", "ROA", "Margin"]) or
                               ("率" in idx and not any(x in idx for x in ["流动比率", "速动比率", "周转率"])))
+                    if pd.isna(v):
+                        return "—"
+                    elif is_pct:
+                        return f"{v*100:.2f}%"
+                    else:
+                        return f"{v:.3f}"
+
+                display = compare_df.copy().astype(object)
+                for idx in display.index:
                     for col in display.columns:
-                        v = display.loc[idx, col]
-                        if pd.isna(v):
-                            display.loc[idx, col] = "—"
-                        elif is_pct:
-                            display.loc[idx, col] = f"{v*100:.2f}%"
-                        else:
-                            display.loc[idx, col] = f"{v:.3f}"
+                        display.at[idx, col] = fmt_peer_cell(compare_df.loc[idx, col], idx)
                 st.dataframe(display, use_container_width=True)
 
             st.session_state["compare_df"] = compare_df
@@ -413,8 +417,8 @@ with tab5:
     if bench_df.empty:
         st.warning(t("no_benchmark_data", LANG))
     else:
-        display_bench = bench_df.copy()
-        for idx, row in display_bench.iterrows():
+        display_bench = bench_df.copy().astype(object)
+        for idx, row in bench_df.iterrows():
             metric = row["指标"]
             is_pct = ("Margin" in metric or
                       ("率" in metric and not any(x in metric for x in ["流动比率", "速动比率", "周转率", "倍数"])))
