@@ -33,25 +33,6 @@ def _yf_call_with_retry(func, *args, max_retries=3, **kwargs):
     raise last_err
 
 
-def _make_yf_session():
-    """创建带自定义 User-Agent 的 session,降低被识别为爬虫的概率"""
-    try:
-        import requests
-        session = requests.Session()
-        session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-        })
-        return session
-    except Exception:
-        return None
-
-
 # 行业候选池 — 每个 sector 对应一批主要公司,用于"同行业+同规模"筛选
 INDUSTRY_PEERS = {
     "Technology": ["AAPL", "MSFT", "GOOGL", "META", "NVDA", "TSM", "ORCL", "ADBE",
@@ -84,10 +65,8 @@ INDUSTRY_PEERS = {
 def fetch_company_info(ticker: str) -> Dict:
     """获取公司基本信息(带 rate-limit 重试)"""
     try:
-        session = _make_yf_session()
-
         def _do_fetch():
-            tk = yf.Ticker(ticker, session=session) if session else yf.Ticker(ticker)
+            tk = yf.Ticker(ticker)
             return tk.info or {}
 
         info = _yf_call_with_retry(_do_fetch)
@@ -114,10 +93,8 @@ def fetch_financials(ticker: str) -> Dict[str, pd.DataFrame]:
     返回: {'income': 利润表, 'balance': 资产负债表, 'cashflow': 现金流量表}
     """
     try:
-        session = _make_yf_session()
-
         def _do_fetch():
-            tk = yf.Ticker(ticker, session=session) if session else yf.Ticker(ticker)
+            tk = yf.Ticker(ticker)
             return {
                 "income": tk.financials if tk.financials is not None else pd.DataFrame(),
                 "balance": tk.balance_sheet if tk.balance_sheet is not None else pd.DataFrame(),
