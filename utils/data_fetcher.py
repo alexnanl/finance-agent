@@ -285,7 +285,7 @@ def looks_like_ticker(s: str) -> bool:
 def search_ticker_by_name(query: str) -> List[Dict]:
     """
     通过公司名搜索 ticker
-    优先查本地速查表,查不到则调用 Yahoo Finance 搜索接口
+    优先查本地速查表(快速 + 不依赖外部 API),查不到则调用 Yahoo Finance 搜索接口
     返回: [{'ticker': 'AAPL', 'name': 'Apple Inc.', 'exchange': 'NMS', 'type': 'EQUITY'}, ...]
     """
     q = (query or "").strip()
@@ -293,25 +293,49 @@ def search_ticker_by_name(query: str) -> List[Dict]:
         return []
 
     results = []
+    seen_tickers = set()
 
-    # 1) 本地速查表(精确/部分匹配)
+    # 1) 本地速查表 - 精确匹配(最优先)
     q_lower = q.lower()
     if q_lower in COMMON_NAME_MAP:
         ticker = COMMON_NAME_MAP[q_lower]
-        info = fetch_company_info(ticker)
-        if info and "error" not in info:
+        if ticker not in seen_tickers:
             results.append({
                 "ticker": ticker,
-                "name": info.get("name", ticker),
-                "exchange": info.get("exchange", ""),
+                "name": q,  # 直接用用户输入的名字
+                "exchange": _guess_exchange_from_ticker(ticker),
                 "type": "EQUITY",
             })
+            seen_tickers.add(ticker)
 
-    # 2) Yahoo Finance 搜索接口(覆盖速查表之外)
+    # 2) 本地速查表 - 模糊匹配(用户输入是某个 key 的子串,或反之)
+    if len(q_lower) >= 2:  # 避免 1 个字母的太宽泛匹配
+        for key, ticker in COMMON_NAME_MAP.items():
+            if ticker in seen_tickers:
+                continue
+            # 用户输入包含在 key 中,或 key 包含在用户输入中
+            if q_lower in key.lower() or key.lower() in q_lower:
+                results.append({
+                    "ticker": ticker,
+                    "name": key,
+                    "exchange": _guess_exchange_from_ticker(ticker),
+                    "type": "EQUITY",
+                })
+                seen_tickers.add(ticker)
+                if len(results) >= 5:  # 速查表最多返回 5 条
+                    break
+
+    # 3) Yahoo Finance 搜索接口(覆盖速查表之外的公司)
     try:
         import requests
         url = "https://query2.finance.yahoo.com/v1/finance/search"
-        headers = {"User-Agent": "Mozilla/5.0"}
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+        }
         resp = requests.get(url, params={"q": q, "quotesCount": 6, "newsCount": 0},
                              headers=headers, timeout=8)
         if resp.ok:
@@ -320,7 +344,7 @@ def search_ticker_by_name(query: str) -> List[Dict]:
                 if item.get("quoteType") not in ("EQUITY",):
                     continue
                 ticker = item.get("symbol", "")
-                if not ticker or any(r["ticker"] == ticker for r in results):
+                if not ticker or ticker in seen_tickers:
                     continue
                 results.append({
                     "ticker": ticker,
@@ -328,7 +352,26 @@ def search_ticker_by_name(query: str) -> List[Dict]:
                     "exchange": item.get("exchDisp") or item.get("exchange", ""),
                     "type": item.get("quoteType", ""),
                 })
+                seen_tickers.add(ticker)
     except Exception:
         pass  # 搜索失败不影响速查表结果
 
     return results[:8]  # 最多返回 8 条
+
+
+def _guess_exchange_from_ticker(ticker: str) -> str:
+    """根据 ticker 后缀推测交易所"""
+    if "." not in ticker:
+        return "NASDAQ/NYSE"  # 美股大概率
+    suffix = ticker.split(".")[-1]
+    return {
+        "HK": "HKEX",
+        "SS": "Shanghai",
+        "SZ": "Shenzhen",
+        "T": "Tokyo",
+        "L": "London",
+        "DE": "XETRA",
+        "PA": "Paris",
+        "MI": "Milan",
+        "AS": "Amsterdam",
+    }.get(suffix, suffix)
