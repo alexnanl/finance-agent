@@ -116,6 +116,15 @@ def tool_dupont_analysis(company: str, year: int = 2024) -> Dict:
     ratios = compute_ratios_for_year(income, balance, cashflow, year_col, prev_col)
     dp = dupont_analysis(ratios)
 
+    calc_method = ratios.get("_calc_method", "ending")
+    method_note = (
+        "本结果使用「平均权益」(期初+期末)/2 计算,符合标准财务分析口径"
+        if calc_method == "average"
+        else "⚠️ 本结果使用「期末权益」计算(因 yfinance 缺少前一年数据"
+              ",通常仅近 4 年有完整可比数据)。该结果会偏离用'平均权益'的标准口径,"
+              "尤其对回购密集的公司差异显著(如 Apple 因股票回购导致期末权益低,ROE 显著偏高)"
+    )
+
     return {
         "ticker": ticker,
         "year": year_col.year,
@@ -124,6 +133,8 @@ def tool_dupont_analysis(company: str, year: int = 2024) -> Dict:
         "权益乘数 (Equity Multiplier)": round(dp["权益乘数"], 4) if dp["权益乘数"] else None,
         "ROE (杜邦计算)": round(dp["ROE (杜邦计算)"], 4) if dp["ROE (杜邦计算)"] else None,
         "ROE (直接计算)": round(dp["ROE (直接计算)"], 4) if dp["ROE (直接计算)"] else None,
+        "计算方法": calc_method,
+        "计算方法说明": method_note,
         "解读": "ROE = 净利率 × 总资产周转率 × 权益乘数。三个因素分别反映销售盈利、资产效率、财务杠杆。"
     }
 
@@ -202,6 +213,9 @@ def tool_peer_comparison(company: str, peers: Optional[List[str]] = None,
             sector=info.get("sector", ""),
             target_market_cap=info.get("market_cap"),
             exclude=ticker, n=4,
+            company_name=info.get("name", ""),
+            industry=info.get("industry", ""),
+            country=info.get("country", ""),
         )
         peer_tickers = [s["ticker"] for s in suggestions]
 
@@ -234,7 +248,12 @@ def tool_peer_comparison(company: str, peers: Optional[List[str]] = None,
 
 def tool_generate_full_report(company: str, year: int = 2024,
                                 include_peers: bool = True) -> Dict:
-    """生成完整 Markdown 分析报告"""
+    """生成完整 Markdown 分析报告
+
+    返回的 dict 包含给 LLM 看的元数据 + 给 UI 渲染下载按钮用的完整数据。
+    chat_page 会用 _full_data 字段调用 build_html/docx/pdf_report 输出 4 种格式,
+    与经典模式完全一致。
+    """
     ticker = resolve_ticker(company)
     if not ticker:
         return {"error": f"无法找到公司「{company}」"}
@@ -263,17 +282,34 @@ def tool_generate_full_report(company: str, year: int = 2024,
             sector=info.get("sector", ""),
             target_market_cap=info.get("market_cap"),
             exclude=ticker, n=3,
+            company_name=info.get("name", ""),
+            industry=info.get("industry", ""),
+            country=info.get("country", ""),
         )
         peer_tickers = [s["ticker"] for s in suggestions]
         if peer_tickers:
             compare_df = compare_with_peers(ticker, peer_tickers, year)
 
-    md = generate_report(info, ratios, dp, trend_df, compare_df, year_col.year)
+    actual_year = year_col.year
+
+    # 简版 Markdown(快速兜底,如果 AI 章节生成失败时用)
+    md = generate_report(info, ratios, dp, trend_df, compare_df, actual_year)
+
     return {
         "ticker": ticker,
-        "year": year_col.year,
+        "year": actual_year,
         "report_markdown": md,
-        "filename": f"{ticker}_{year_col.year}_财务分析报告.md",
+        "filename": f"{ticker}_{actual_year}_财务分析报告.md",
+        # ★ 完整数据(给 UI 用,LLM 不会看到这部分)
+        "_full_data": {
+            "info": info,
+            "ratios": ratios,
+            "dupont": dp,
+            "trend_df": trend_df,
+            "compare_df": compare_df,
+            "actual_year": actual_year,
+            "ticker": ticker,
+        },
     }
 
 
