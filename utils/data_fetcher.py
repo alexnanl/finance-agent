@@ -113,10 +113,13 @@ def fetch_financials(ticker: str) -> Dict[str, pd.DataFrame]:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_stock_price(ticker: str, period: str = "5y") -> pd.DataFrame:
-    """获取股价历史"""
+    """获取股价历史(带 rate-limit 重试)"""
     try:
-        tk = yf.Ticker(ticker)
-        return tk.history(period=period)
+        def _do_fetch():
+            tk = yf.Ticker(ticker)
+            return tk.history(period=period)
+
+        return _yf_call_with_retry(_do_fetch)
     except Exception:
         return pd.DataFrame()
 
@@ -129,62 +132,252 @@ def get_peer_suggestions(sector: str, exclude: str = "") -> List[str]:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _get_market_cap_for_ticker(ticker: str) -> Optional[float]:
-    """轻量获取市值,用于规模匹配。失败返回 None。"""
+    """轻量获取市值,用于规模匹配。带 rate-limit 重试。失败返回 None。
+
+    ★ 重要:这个函数被 get_peer_suggestions_by_size 调用,
+       如果没 retry,Yahoo 限流时同行的市值都拿不到 → AI 推荐的真同行
+       会被淘汰,池子里的伪同行(麦当劳/TJX)反而胜出。
+    """
     try:
-        tk = yf.Ticker(ticker)
-        info = tk.info or {}
-        return info.get("marketCap")
+        def _do_fetch():
+            tk = yf.Ticker(ticker)
+            info = tk.info or {}
+            return info.get("marketCap")
+
+        return _yf_call_with_retry(_do_fetch, max_retries=2)  # 同行用 2 次重试,避免太慢
     except Exception:
         return None
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def _ai_suggest_peers(company_name: str, ticker: str, sector: str,
+                       industry: str, country: str,
+                       market_cap: Optional[float], n: int = 5) -> List[str]:
+    """
+    用 LLM 智能推荐同行公司
+    返回 ticker 列表,如 ['000333.SZ', 'WHR', 'ELUXY', ...]
+    """
+    # 获取 API Key
+    api_key = None
+    try:
+        api_key = st.secrets.get("OPENAI_API_KEY", None)
+    except Exception:
+        pass
+    if not api_key:
+        import os
+        api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return []
+
+    try:
+        from openai import OpenAI
+        import json as _json
+
+        client = OpenAI(api_key=api_key)
+
+        market_cap_desc = ""
+        if market_cap:
+            if market_cap > 1e11:
+                market_cap_desc = f"市值约 {market_cap/1e9:.0f}B(超大盘)"
+            elif market_cap > 1e10:
+                market_cap_desc = f"市值约 {market_cap/1e9:.0f}B(大盘)"
+            else:
+                market_cap_desc = f"市值约 {market_cap/1e9:.1f}B(中小盘)"
+
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "你是金融行业分析师,精通全球上市公司分类。"
+                        "用户给你一家公司的信息,你推荐它最直接的竞争对手/同行业可比公司。"
+                        "\n\n"
+                        "**核心原则**:\n"
+                        "1. **细分赛道**优先 — 比如海尔做白色家电,推荐美的、格力、Whirlpool,而不是麦当劳\n"
+                        "2. **规模相近** — 优先推荐市值在目标公司 1/3x 到 3x 范围的\n"
+                        "3. **市场多元** — 兼顾本国市场 + 海外市场代表(更专业)\n"
+                        "4. **真实可比** — 必须是同业务模式的公司,不能只是同 sector\n"
+                        "\n"
+                        "**ticker 格式严格遵守 Yahoo Finance**:\n"
+                        "- 美股直接代码: AAPL, WHR\n"
+                        "- 港股带 .HK: 0700.HK\n"
+                        "- 上交所 .SS: 600519.SS\n"
+                        "- 深交所 .SZ: 000333.SZ\n"
+                        "- 日股 .T,韩股 .KS,英股 .L,德股 .DE,法股 .PA,瑞士 .SW\n"
+                        "\n"
+                        "返回 JSON: {\"peers\": [\"ticker1\", \"ticker2\", ...]}\n"
+                        "**只返回 ticker,不要公司名,不要解释**"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"目标公司:{company_name} ({ticker})\n"
+                        f"行业:{sector} / {industry}\n"
+                        f"国家:{country}\n"
+                        f"{market_cap_desc}\n"
+                        f"\n请推荐 {n} 家最直接的同行竞争对手。"
+                    ),
+                },
+            ],
+            temperature=0.2,
+            max_tokens=200,
+            response_format={"type": "json_object"},
+        )
+        result = _json.loads(resp.choices[0].message.content or "{}")
+        peers = result.get("peers", [])
+        # 过滤无效 ticker(空字符串、太长等)
+        peers = [p for p in peers if p and isinstance(p, str) and len(p) <= 12]
+        # 排除目标公司自己
+        peers = [p for p in peers if p.upper() != ticker.upper()]
+        # 调试:成功时在控制台打印,方便部署后排查
+        try:
+            import sys
+            print(f"[_ai_suggest_peers] {company_name}({ticker}) → {peers[:n]}",
+                   file=sys.stderr, flush=True)
+        except Exception:
+            pass
+        return peers[:n]
+    except Exception as e:
+        # 调试:失败时在控制台打印,方便部署后排查
+        try:
+            import sys
+            print(f"[_ai_suggest_peers] FAILED for {company_name}({ticker}): "
+                   f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        except Exception:
+            pass
+        return []
+
+
 def get_peer_suggestions_by_size(sector: str, target_market_cap: Optional[float],
                                     exclude: str = "", n: int = 4,
-                                    size_tolerance: float = 3.0) -> List[Dict]:
+                                    size_tolerance: float = 3.0,
+                                    company_name: str = "",
+                                    industry: str = "",
+                                    country: str = "") -> List[Dict]:
     """
-    按"行业 + 规模"筛选同行
-    - sector: 目标公司所属行业
+    按"行业 + 规模"筛选同行 — 优先用 LLM 智能推荐,失败 fallback 到硬编码池
+
+    ★ 关键设计:AI 推荐的同行**永远排在 INDUSTRY_PEERS 池子之前**,
+       即使市值差距大也不会被池子里的"伪同行"挤掉。
+       池子只在 AI 推荐不够 n 个时补位。
+
+    - sector: 目标公司所属 sector
     - target_market_cap: 目标公司市值
     - exclude: 排除的 ticker
     - n: 返回几个
     - size_tolerance: 市值容忍倍数(默认 3 倍 → 1/3x ~ 3x)
+    - company_name / industry / country: 用于 LLM 智能推荐
     返回: [{'ticker': 'MSFT', 'market_cap': 3.5e12, 'size_ratio': 1.05}, ...]
     """
-    candidates = INDUSTRY_PEERS.get(sector, [])
-    candidates = [c for c in candidates if c.upper() != (exclude or "").upper()]
-
-    if not target_market_cap:
-        return [{"ticker": c, "market_cap": None, "size_ratio": None}
-                for c in candidates[:n]]
-
     import math
-    scored = []
-    for c in candidates:
+
+    # ===== 优先级 1:LLM 智能推荐 =====
+    ai_peers = []
+    if company_name and (industry or sector):
+        ai_peers = _ai_suggest_peers(
+            company_name=company_name,
+            ticker=exclude or "",
+            sector=sector or "",
+            industry=industry or "",
+            country=country or "",
+            market_cap=target_market_cap,
+            n=n + 2,  # 多要几个,后面 fallback 用
+        )
+    # 去重 + 排除自己
+    ai_peers_clean = []
+    seen_ai = set()
+    for p in ai_peers:
+        pu = p.upper()
+        if pu in seen_ai or pu == (exclude or "").upper():
+            continue
+        seen_ai.add(pu)
+        ai_peers_clean.append(p)
+
+    # ===== 优先级 2:行业池(只在 AI 推荐不够时用)=====
+    pool_peers = []
+    seen_pool = set(seen_ai) | {(exclude or "").upper()}
+    for p in INDUSTRY_PEERS.get(sector, []):
+        if p.upper() in seen_pool:
+            continue
+        seen_pool.add(p.upper())
+        pool_peers.append(p)
+
+    # ===== 没有 target_market_cap 时,直接返回 AI 优先列表 =====
+    if not target_market_cap:
+        all_picked = ai_peers_clean[:n]
+        if len(all_picked) < n:
+            all_picked.extend(pool_peers[: n - len(all_picked)])
+        return [{"ticker": c, "market_cap": None, "size_ratio": None}
+                for c in all_picked[:n]]
+
+    # ===== 阶段 A:把 AI 推荐转成 scored 结构 =====
+    # 关键:AI 推荐的同行,只要市值能拿到就保留
+    # 不像之前那样被 size_tolerance 过滤 — AI 已经判断过业务相关性了
+    ai_scored = []
+    for c in ai_peers_clean:
+        cap = _get_market_cap_for_ticker(c)
+        if cap is None or cap <= 0:
+            # 拿不到市值的也保留(用 None,不参与排序但占名额)
+            ai_scored.append({"ticker": c, "market_cap": None, "size_ratio": None,
+                                "_source": "ai", "_sort_key": 999})
+            continue
+        ratio = cap / target_market_cap
+        ai_scored.append({"ticker": c, "market_cap": cap, "size_ratio": ratio,
+                            "_source": "ai", "_sort_key": abs(math.log(ratio))})
+
+    # AI 推荐内部按规模接近度排序(但不会被淘汰)
+    ai_scored.sort(key=lambda x: x["_sort_key"])
+
+    # 如果 AI 推荐已经够 n 个,直接返回(完全不用池子)
+    if len(ai_scored) >= n:
+        result = []
+        for s in ai_scored[:n]:
+            result.append({"ticker": s["ticker"],
+                            "market_cap": s["market_cap"],
+                            "size_ratio": s["size_ratio"]})
+        return result
+
+    # ===== 阶段 B:AI 推荐不够 n 个,用池子补位 =====
+    # 池子里的同行用 size_tolerance 严格筛选(避免 MCD 这种超大盘乱入)
+    pool_scored = []
+    for c in pool_peers:
         cap = _get_market_cap_for_ticker(c)
         if cap is None or cap <= 0:
             continue
         ratio = cap / target_market_cap
         if (1.0 / size_tolerance) <= ratio <= size_tolerance:
-            scored.append({"ticker": c, "market_cap": cap, "size_ratio": ratio})
+            pool_scored.append({"ticker": c, "market_cap": cap, "size_ratio": ratio,
+                                  "_sort_key": abs(math.log(ratio))})
+    pool_scored.sort(key=lambda x: x["_sort_key"])
 
-    scored.sort(key=lambda x: abs(math.log(x["size_ratio"])))
-
-    # 不够 n 个时,放宽筛选
-    if len(scored) < n:
-        already = {s["ticker"] for s in scored}
+    # 还不够 n 个,再放宽 size 限制
+    if len(ai_scored) + len(pool_scored) < n:
+        already = {s["ticker"] for s in pool_scored}
         backup = []
-        for c in candidates:
+        for c in pool_peers:
             if c in already:
                 continue
             cap = _get_market_cap_for_ticker(c)
             if cap is None:
                 continue
             ratio = cap / target_market_cap
-            backup.append({"ticker": c, "market_cap": cap, "size_ratio": ratio})
-        backup.sort(key=lambda x: abs(math.log(x["size_ratio"])))
-        scored.extend(backup[: n - len(scored)])
+            backup.append({"ticker": c, "market_cap": cap, "size_ratio": ratio,
+                            "_sort_key": abs(math.log(ratio))})
+        backup.sort(key=lambda x: x["_sort_key"])
+        pool_scored.extend(backup[: n - len(ai_scored) - len(pool_scored)])
 
-    return scored[:n]
+    # ===== 合并:AI 优先 + 池子补位 =====
+    final = []
+    for s in ai_scored + pool_scored:
+        final.append({"ticker": s["ticker"],
+                       "market_cap": s["market_cap"],
+                       "size_ratio": s["size_ratio"]})
+        if len(final) >= n:
+            break
+
+    return final[:n]
 
 
 # 常用公司中英文名 → ticker 速查表(覆盖主流大盘股,避免每次走网络搜索)
